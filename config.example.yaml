@@ -20,7 +20,7 @@ allowedOrigins:
   - "http://localhost:*"
   - "http://127.0.0.1:*"
 
-# API keys (must start with "sk-" and be at least 20 characters)
+# API keys (must start with "oc_sk_", "sk-" or "user_" and be at least 20 characters)
 keys:
   - label: account1
     key: sk-abc123...

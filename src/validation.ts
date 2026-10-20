@@ -23,10 +23,10 @@ export function isValidPort(value: unknown): value is number {
 /**
  * Check if the given string looks like a valid API key.
  *
- * Multi-provider aware: accepts `sk-` (opencode-go / commandcode console
- * keys) and `user_` (commandcode tokens) of at least {@link MIN_KEY_LENGTH}
- * characters. Structural check only — provider identity is confirmed by the
- * smoke test in `identifyKey()`.
+ * Multi-provider aware: accepts `oc_sk_` (OpenCode-Go), `sk-` (opencode-go /
+ * commandcode console keys) and `user_` (commandcode tokens) of at least
+ * {@link MIN_KEY_LENGTH} characters. Structural check only — provider
+ * identity is confirmed by the smoke test in `identifyKey()`.
  */
 export function isValidApiKey(key: unknown): key is string {
   return typeof key === 'string' && isPlausibleKey(key);

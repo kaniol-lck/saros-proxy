@@ -99,9 +99,9 @@ export async function identifyKey(
 
 /**
  * Extract candidate API keys from arbitrary pasted text (TUI drop-a-key
- * flow). Matches user_... and sk-... tokens of plausible length; dedupes.
+ * flow). Matches oc_sk_, user_ and sk- tokens of plausible length; dedupes.
  */
 export function extractKeys(text: string): string[] {
-  const matches = text.match(/(?:user_|sk-)[A-Za-z0-9_-]{16,}/g) ?? [];
+  const matches = text.match(/(?:oc_sk_|user_|sk-)[A-Za-z0-9_-]{16,}/g) ?? [];
   return [...new Set(matches)];
 }

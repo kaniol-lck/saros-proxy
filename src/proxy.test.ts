@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import {
   buildUpstreamUrl,
   buildUpstreamHeaders,
+  deriveOpencodeSessionId,
   isStreamingRequest,
   createProxyApp,
 } from './proxy.js';
@@ -9,6 +10,32 @@ import { resetModelsFetcherState } from './models-fetcher.js';
 import { loadModelsFromJson } from './cli/opencode-config.js';
 import type { ProxyConfig } from './config.js';
 import { MAX_BODY_SIZE } from './constants.js';
+
+describe('deriveOpencodeSessionId', () => {
+  it('keeps the id stable across turns of one conversation', () => {
+    const firstTurn = JSON.stringify({ messages: [{ role: 'user', content: 'hello' }] });
+    const secondTurn = JSON.stringify({
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'hi' },
+        { role: 'user', content: 'again' },
+      ],
+    });
+    const id = deriveOpencodeSessionId(firstTurn);
+    expect(id).toMatch(/^saros-[0-9a-f]{32}$/);
+    expect(deriveOpencodeSessionId(secondTurn)).toBe(id);
+  });
+
+  it('separates different conversations and non-JSON bodies', () => {
+    const a = deriveOpencodeSessionId(JSON.stringify({ messages: [{ content: 'a' }] }));
+    const b = deriveOpencodeSessionId(JSON.stringify({ messages: [{ content: 'b' }] }));
+    expect(a).not.toBe(b);
+
+    const fallback = deriveOpencodeSessionId('not json');
+    expect(fallback).toMatch(/^saros-[0-9a-f]{16}$/);
+    expect(deriveOpencodeSessionId('not json')).not.toBe(fallback);
+  });
+});
 
 describe('buildUpstreamUrl', () => {
   it('combines base URL and path', () => {
@@ -826,9 +853,50 @@ describe('createProxyApp — provider mapping & extra headers', () => {
     // Provider-specific CLI identity headers are injected upstream.
     expect(headers.get('x-commandcode-client')).toBe('cli');
     expect(headers.get('x-command-code-version')).toBeTruthy();
+    // Session header is opencode-go only.
+    expect(headers.get('x-opencode-session')).toBeNull();
     // The @commandcode routing suffix is stripped before upstream.
     const body = JSON.parse(String(init.body)) as { model: string };
     expect(body.model).toBe('claude-opus-5');
+  });
+
+  it('injects a stable x-opencode-session for opencode-go and keeps client values', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"ok":true}', { status: 200 }),
+    );
+    const app = createProxyApp(makeConfig({
+      keys: [{ label: 'oc', key: 'oc_sk_key-0001', provider: 'opencode-go' }],
+    }));
+    const firstTurn = JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [{ role: 'user', content: 'hello' }],
+    });
+    const secondTurn = JSON.stringify({
+      model: 'deepseek-v4.1-flash',
+      messages: [
+        { role: 'user', content: 'hello' },
+        { role: 'assistant', content: 'hi' },
+      ],
+    });
+
+    await app.request('/zen/go/v1/chat/completions', {
+      method: 'POST', body: firstTurn, headers: { 'content-type': 'application/json' },
+    });
+    await app.request('/zen/go/v1/chat/completions', {
+      method: 'POST', body: secondTurn, headers: { 'content-type': 'application/json' },
+    });
+
+    const headerOf = (call: number): string | null =>
+      (((fetchMock.mock.calls[call][1] as RequestInit).headers) as Headers).get('x-opencode-session');
+    expect(headerOf(0)).toMatch(/^saros-[0-9a-f]{32}$/);
+    expect(headerOf(1)).toBe(headerOf(0));
+
+    await app.request('/zen/go/v1/chat/completions', {
+      method: 'POST',
+      body: firstTurn,
+      headers: { 'content-type': 'application/json', 'x-opencode-session': 'client-session' },
+    });
+    expect(headerOf(2)).toBe('client-session');
   });
 
   it('handles a non-object JSON request body (JSON array)', async () => {

@@ -212,7 +212,7 @@ export function validateNonInteractiveArgs(opts: SetupOptions): ValidationError[
     for (const k of keys) {
       if (!k.label) errors.push({ field: 'keys', message: 'Key label cannot be empty' });
       if (!isValidApiKey(k.key)) {
-        errors.push({ field: 'keys', message: `Key "${k.label}" must start with "sk-" or "user_" and be at least 20 characters` });
+        errors.push({ field: 'keys', message: `Key "${k.label}" must start with "oc_sk_", "sk-" or "user_" and be at least 20 characters` });
       }
     }
   }
@@ -650,7 +650,7 @@ async function promptAccountApiKey(): Promise<string> {
   return ui.assertNotCancelled(await ui.password({
     message: 'API key',
     validate: (v) => {
-      if (!v || !isValidApiKey(v)) return 'API key must start with "sk-" or "user_" and be at least 20 characters long.';
+      if (!v || !isValidApiKey(v)) return 'API key must start with "oc_sk_", "sk-" or "user_" and be at least 20 characters long.';
     },
   }));
 }

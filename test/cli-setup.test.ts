@@ -243,6 +243,10 @@ describe('CLI Setup Wizard', () => {
         expect(isValidApiKey('sk-' + 'a'.repeat(20))).toBe(true);
       });
 
+      it('accepts oc_sk_ opencode keys', () => {
+        expect(isValidApiKey('oc_sk_' + 'a'.repeat(20))).toBe(true);
+      });
+
       it('accepts key exactly 20 characters total', () => {
         // sk- (3) + 17 = 20 total
         expect(isValidApiKey('sk-' + 'a'.repeat(17))).toBe(true);

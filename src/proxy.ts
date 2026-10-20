@@ -273,6 +273,49 @@ export function buildUpstreamHeaders(
 }
 
 /**
+ * Stable per-conversation id for OpenCode-Go, which rejects requests
+ * without `x-opencode-session` (routing + prompt-cache key).
+ *
+ * The first message is the conversation fingerprint — it does not change
+ * across turns — hashed twice with FNV-1a 64-bit. Non-JSON bodies fall back
+ * to a random id: presence is what the upstream requires.
+ */
+export function deriveOpencodeSessionId(bodyText: string): string {
+  const fingerprint = conversationFingerprint(bodyText);
+  if (fingerprint === null) {
+    return `saros-${crypto.randomUUID().replaceAll('-', '').slice(0, 16)}`;
+  }
+  const first = fnv1a64(fingerprint);
+  const second = fnv1a64(`${fingerprint}\u0000saros`);
+  return `saros-${first.toString(16).padStart(16, '0')}${second.toString(16).padStart(16, '0')}`;
+}
+
+function conversationFingerprint(bodyText: string): string | null {
+  try {
+    const parsed = JSON.parse(bodyText) as { messages?: Array<{ content?: unknown }> };
+    const content = parsed?.messages?.[0]?.content;
+    if (typeof content === 'string') return content;
+    if (content !== undefined && content !== null) return JSON.stringify(content);
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+const FNV_OFFSET_BASIS = 0xcbf29ce484222325n;
+const FNV_PRIME = 0x100000001b3n;
+const UINT64_MASK = 0xffffffffffffffffn;
+
+function fnv1a64(input: string): bigint {
+  let hash = FNV_OFFSET_BASIS;
+  for (let i = 0; i < input.length; i++) {
+    hash ^= BigInt(input.charCodeAt(i));
+    hash = (hash * FNV_PRIME) & UINT64_MASK;
+  }
+  return hash;
+}
+
+/**
  * Clean headers for downstream (client) response: strip hop-by-hop headers,
  * security-sensitive headers, internal debug headers, and content-length
  * (the Response constructor recalculates content-length automatically).
@@ -465,6 +508,11 @@ function buildFetchOptions(
     for (const [name, value] of Object.entries(provider.extraUpstreamHeaders())) {
       headers.set(name, value);
     }
+  }
+  // OpenCode-Go requires a stable session id; client-supplied values win
+  // (buildUpstreamHeaders forwards them verbatim).
+  if (provider?.id === 'opencode-go' && bodyText && !headers.has('x-opencode-session')) {
+    headers.set('x-opencode-session', deriveOpencodeSessionId(bodyText));
   }
   const options: RequestInit & { duplex?: 'half' } = { method, headers };
   if (!bodyText) return options;

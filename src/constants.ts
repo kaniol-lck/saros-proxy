@@ -11,6 +11,8 @@ export const DEFAULT_CIRCUIT_BREAKER_COOLDOWN_MS = 60_000;
 export const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
 export const MIN_KEY_LENGTH = 20;
 export const API_KEY_PREFIX = 'sk-';
+/** OpenCode console keys minted after the 2026-10 rotation (provider-exclusive). */
+export const OPENCODE_GO_KEY_PREFIX = 'oc_sk_';
 export const DEFAULT_UPSTREAM_URL = 'https://opencode.ai';
 // Multi-provider upstreams (overridable via config `upstreams:` map).
 // Chat route prefixes live on the provider adapters (chatBasePath).

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **OpenCode-Go `oc_sk_…` keys** — accepted everywhere: `opencode-go.quickMatch`
+  returns a definitive `yes` (CommandCode returns `no`, so identification no
+  longer needs a network probe), pasted-key extraction matches the prefix, and
+  config/setup validation accepts it. Legacy `sk-…` keys keep working.
+
 ## [0.9.0] - 2026-08-29
 
 ### Added

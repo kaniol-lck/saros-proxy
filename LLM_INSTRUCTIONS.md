@@ -97,7 +97,7 @@ If the user answers "Not saved yet" for keys, tell them:
 > secondary sk-your-second-key-here
 > commandcode user_your-commandcode-token
 > ```
-> Keys must start with `sk-` (OpenCode-Go **or** CommandCode) or `user_` (CommandCode), and be at least 20 characters. `user_` keys are always CommandCode; for CommandCode `sk-` console keys add the provider as a third column:
+> Keys must start with `oc_sk_` (OpenCode-Go), `sk-` (OpenCode-Go **or** CommandCode) or `user_` (CommandCode), and be at least 20 characters. `user_` keys are always CommandCode; for CommandCode `sk-` console keys add the provider as a third column:
 > ```
 > cc-console sk-your-console-key commandcode
 > ```

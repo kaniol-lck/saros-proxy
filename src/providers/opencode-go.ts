@@ -7,6 +7,7 @@
 import {
   API_KEY_PREFIX,
   MIN_KEY_LENGTH,
+  OPENCODE_GO_KEY_PREFIX,
   USAGE_PATH,
 } from '../constants.js';
 import type { KeyProvider, KeyUsage, PrefixMatch, SmokeResult } from './types.js';
@@ -95,10 +96,11 @@ export const opencodeGoProvider: KeyProvider = {
   chatBasePath: '/zen/go/v1',
 
   quickMatch(key: string): PrefixMatch {
+    if (key.length < MIN_KEY_LENGTH) return 'no';
+    // oc_sk_ is minted only by OpenCode → definitive.
+    if (key.startsWith(OPENCODE_GO_KEY_PREFIX)) return 'yes';
     // sk- is shared with commandcode → never a definitive 'yes'.
-    return key.startsWith(API_KEY_PREFIX) && key.length >= MIN_KEY_LENGTH
-      ? 'maybe'
-      : 'no';
+    return key.startsWith(API_KEY_PREFIX) ? 'maybe' : 'no';
   },
 
   async smokeTest(key: string, timeoutMs = 10_000): Promise<SmokeResult> {

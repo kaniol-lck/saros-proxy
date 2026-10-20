@@ -34,7 +34,7 @@ Manage multiple API keys behind a single endpoint — OpenCode-Go **and** Comman
 
 ## Features
 
-- **Multi-provider keys** — Mix OpenCode-Go (`sk-…`) and CommandCode (`user_…` / `sk-…`) keys in one pool.
+- **Multi-provider keys** — Mix OpenCode-Go (`oc_sk_…` / legacy `sk-…`) and CommandCode (`user_…` / `sk-…`) keys in one pool.
 - **Paste-a-key setup** — Drop any text containing keys into the setup wizard; Saros extracts them and identifies the provider by pinging each provider's API (smoke test).
 - **Multi-key rotation** — Round-robin across all your API keys.
 - **Auto failover** — Retry failed requests with the next healthy key.
@@ -304,6 +304,7 @@ Saros accepts keys from multiple providers. A key must be at least 20 characters
 
 | Prefix | Provider | Notes |
 |---|---|---|
+| `oc_sk_…` | OpenCode-Go | Minted only by OpenCode since the 2026-10 key rotation — definitive |
 | `sk-…` | OpenCode-Go or CommandCode | `sk-` is shared by both providers; Saros infers OpenCode-Go unless an explicit `provider` is set |
 | `user_…` | CommandCode | Always detected as CommandCode |
 

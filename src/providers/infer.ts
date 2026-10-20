@@ -2,10 +2,10 @@
  * infer.ts — Synchronous provider inference for config-time decisions.
  *
  * Config loading must never block on network I/O, so the provider for each
- * key is inferred structurally here ('user_' → commandcode; 'sk-' →
- * opencode-go, the legacy default). The authoritative, empirical answer
- * comes from identifyKey() (async, network) — the setup wizard uses it and
- * persists the result as an explicit `provider` field in config.yaml.
+ * key is inferred structurally here ('user_' → commandcode; 'oc_sk_' and
+ * 'sk-' → opencode-go, the legacy default). The authoritative, empirical
+ * answer comes from identifyKey() (async, network) — the setup wizard uses it
+ * and persists the result as an explicit `provider` field in config.yaml.
  */
 import type { ProviderId } from './types.js';
 

@@ -78,6 +78,12 @@ describe('quickMatch', () => {
     expect(commandcodeProvider.quickMatch(key)).toBe('maybe');
   });
 
+  it('oc_sk_ prefix uniquely identifies opencode-go', () => {
+    const key = 'oc_sk_' + 'a'.repeat(40);
+    expect(opencodeGoProvider.quickMatch(key)).toBe('yes');
+    expect(commandcodeProvider.quickMatch(key)).toBe('no');
+  });
+
   it('rejects short or foreign keys', () => {
     expect(opencodeGoProvider.quickMatch('sk-short')).toBe('no');
     expect(commandcodeProvider.quickMatch('tok_' + 'a'.repeat(40))).toBe('no');
@@ -106,6 +112,7 @@ describe('registry', () => {
   it('isPlausibleKey accepts both formats and rejects junk', () => {
     expect(isPlausibleKey('sk-' + 'a'.repeat(40))).toBe(true);
     expect(isPlausibleKey('user_' + 'a'.repeat(40))).toBe(true);
+    expect(isPlausibleKey('oc_sk_' + 'a'.repeat(40))).toBe(true);
     expect(isPlausibleKey('garbage')).toBe(false);
     expect(isPlausibleKey('')).toBe(false);
   });
@@ -117,6 +124,11 @@ describe('extractKeys', () => {
     const keys = extractKeys(text);
     expect(keys).toContain('sk-abcdefghijklmnop1234567890');
     expect(keys).toContain('user_abcdefghijklmnop1234567890');
+  });
+
+  it('extracts oc_sk_ opencode keys', () => {
+    const text = 'OPENCODE_API_KEY=oc_sk_abcdefghijklmnop1234567890';
+    expect(extractKeys(text)).toEqual(['oc_sk_abcdefghijklmnop1234567890']);
   });
 
   it('dedupes repeated keys', () => {
@@ -133,6 +145,12 @@ describe('identifyKey (offline)', () => {
   it('routes user_ keys to commandcode unverified', async () => {
     const result = await identifyKey('user_' + 'a'.repeat(40), { verify: false });
     expect(result.provider).toBe('commandcode');
+    expect(result.confidence).toBe('unverified');
+  });
+
+  it('routes oc_sk_ keys to opencode-go unverified', async () => {
+    const result = await identifyKey('oc_sk_' + 'a'.repeat(40), { verify: false });
+    expect(result.provider).toBe('opencode-go');
     expect(result.confidence).toBe('unverified');
   });
 
