@@ -114,10 +114,10 @@ export function printNextSteps(port: number): void {
 // Cancellation helper
 // ---------------------------------------------------------------------------
 
-export function assertNotCancelled<T>(value: T | symbol): T {
+export function assertNotCancelled<T>(value: T | symbol): Exclude<T, symbol> {
   if (isCancel(value)) {
     outro(chalk.red('Setup cancelled.'));
     process.exit(1);
   }
-  return value;
+  return value as Exclude<T, symbol>;
 }
