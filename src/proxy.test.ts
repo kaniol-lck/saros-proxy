@@ -35,6 +35,20 @@ describe('deriveOpencodeSessionId', () => {
     expect(fallback).toMatch(/^saros-[0-9a-f]{16}$/);
     expect(deriveOpencodeSessionId('not json')).not.toBe(fallback);
   });
+
+  it('fingerprints array content and falls back when content is missing', () => {
+    const arrayContent = JSON.stringify({
+      messages: [{ content: [{ type: 'text', text: 'hello' }] }],
+    });
+    const id = deriveOpencodeSessionId(arrayContent);
+    expect(id).toMatch(/^saros-[0-9a-f]{32}$/);
+    expect(deriveOpencodeSessionId(arrayContent)).toBe(id);
+
+    expect(deriveOpencodeSessionId(JSON.stringify({ messages: [{ content: null }] }))).toMatch(
+      /^saros-[0-9a-f]{16}$/,
+    );
+    expect(deriveOpencodeSessionId(JSON.stringify({ messages: [] }))).toMatch(/^saros-[0-9a-f]{16}$/);
+  });
 });
 
 describe('buildUpstreamUrl', () => {
@@ -897,6 +911,22 @@ describe('createProxyApp — provider mapping & extra headers', () => {
       headers: { 'content-type': 'application/json', 'x-opencode-session': 'client-session' },
     });
     expect(headerOf(2)).toBe('client-session');
+  });
+
+  it('does not inject x-opencode-session on bodyless GET requests', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"ok":true}', { status: 200 }),
+    );
+    const app = createProxyApp(makeConfig({
+      keys: [{ label: 'oc', key: 'oc_sk_key-0001', provider: 'opencode-go' }],
+    }));
+
+    const res = await app.request('/zen/go/v1/bodyless', { method: 'GET' });
+
+    expect(res.status).toBe(200);
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect((init.headers as Headers).get('x-opencode-session')).toBeNull();
+    expect(init.body).toBeUndefined();
   });
 
   it('handles a non-object JSON request body (JSON array)', async () => {
