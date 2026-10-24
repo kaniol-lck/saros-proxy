@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-24
+
+### Changed
+
+- **npm releases use Trusted Publishing (OIDC).** The Publish workflow now
+  authenticates with the job's short-lived `id-token` instead of a long-lived
+  `NPM_TOKEN` secret: no publishing credential to rotate, and npm attaches
+  provenance automatically. The `NPM_TOKEN` repository secret is no longer
+  used by the npm step.
+
 ## [0.10.0] - 2026-10-24
 
 ### Added
@@ -216,7 +226,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hop-by-hop header sanitization
 - Non-root Docker user
 
-[Unreleased]: https://github.com/vitorvilaca3011/saros-proxy/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/vitorvilaca3011/saros-proxy/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/vitorvilaca3011/saros-proxy/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/vitorvilaca3011/saros-proxy/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/vitorvilaca3011/saros-proxy/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/vitorvilaca3011/saros-proxy/releases/tag/v0.8.0

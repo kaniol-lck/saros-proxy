@@ -59,26 +59,24 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read
-      id-token: write # OIDC — enables npm provenance
+      id-token: write # OIDC — trusted publishing + npm provenance
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
-          registry-url: 'https://registry.npmjs.org'
       - name: Download dist
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: dist
           path: dist/
       - name: Publish
-        # --provenance disabled: with NODE_AUTH_TOKEN it fails with
-        # `404 PUT registry.npmjs.org/<pkg>` after signing the statement
-        # (signed to sigstore, but the token PUT is rejected). Re-enable
-        # once publishing moves to OIDC-exclusive auth.
+        # Trusted publishing (OIDC): the npm registry exchanges this job's
+        # id-token for a short-lived publishing credential and attaches
+        # provenance automatically. No NPM_TOKEN and no `registry-url` —
+        # setup-node's generated .npmrc would point the auth at an empty
+        # ${NODE_AUTH_TOKEN} and pre-empt the OIDC handshake.
         run: npm publish --access public --ignore-scripts
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
   # ── Publish to GitHub Packages ────────────────────────────────────────────
   publish-github:
