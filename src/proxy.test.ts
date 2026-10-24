@@ -1,55 +1,26 @@
 import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
+
+// Isolate persisted counters (model-stats, token-usage) from the user's real
+// ~/.config/saros/ — these tests forward requests through real proxy apps and
+// would otherwise book their fake keys/models into the live stats files.
+process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), 'saros-proxy-test-'));
+import { mkdtempSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 import {
   buildUpstreamUrl,
   buildUpstreamHeaders,
-  deriveOpencodeSessionId,
   isStreamingRequest,
+  prepareOutboundRequest,
   createProxyApp,
 } from './proxy.js';
+import { opencodeGoProvider } from './providers/opencode-go.js';
+import type { KeyProvider } from './providers/index.js';
 import { resetModelsFetcherState } from './models-fetcher.js';
+import { getKeyTokenUsage, resetTokenUsage } from './token-usage.js';
 import { loadModelsFromJson } from './cli/opencode-config.js';
 import type { ProxyConfig } from './config.js';
 import { MAX_BODY_SIZE } from './constants.js';
-
-describe('deriveOpencodeSessionId', () => {
-  it('keeps the id stable across turns of one conversation', () => {
-    const firstTurn = JSON.stringify({ messages: [{ role: 'user', content: 'hello' }] });
-    const secondTurn = JSON.stringify({
-      messages: [
-        { role: 'user', content: 'hello' },
-        { role: 'assistant', content: 'hi' },
-        { role: 'user', content: 'again' },
-      ],
-    });
-    const id = deriveOpencodeSessionId(firstTurn);
-    expect(id).toMatch(/^saros-[0-9a-f]{32}$/);
-    expect(deriveOpencodeSessionId(secondTurn)).toBe(id);
-  });
-
-  it('separates different conversations and non-JSON bodies', () => {
-    const a = deriveOpencodeSessionId(JSON.stringify({ messages: [{ content: 'a' }] }));
-    const b = deriveOpencodeSessionId(JSON.stringify({ messages: [{ content: 'b' }] }));
-    expect(a).not.toBe(b);
-
-    const fallback = deriveOpencodeSessionId('not json');
-    expect(fallback).toMatch(/^saros-[0-9a-f]{16}$/);
-    expect(deriveOpencodeSessionId('not json')).not.toBe(fallback);
-  });
-
-  it('fingerprints array content and falls back when content is missing', () => {
-    const arrayContent = JSON.stringify({
-      messages: [{ content: [{ type: 'text', text: 'hello' }] }],
-    });
-    const id = deriveOpencodeSessionId(arrayContent);
-    expect(id).toMatch(/^saros-[0-9a-f]{32}$/);
-    expect(deriveOpencodeSessionId(arrayContent)).toBe(id);
-
-    expect(deriveOpencodeSessionId(JSON.stringify({ messages: [{ content: null }] }))).toMatch(
-      /^saros-[0-9a-f]{16}$/,
-    );
-    expect(deriveOpencodeSessionId(JSON.stringify({ messages: [] }))).toMatch(/^saros-[0-9a-f]{16}$/);
-  });
-});
 
 describe('buildUpstreamUrl', () => {
   it('combines base URL and path', () => {
@@ -164,6 +135,134 @@ describe('isStreamingRequest', () => {
     expect(isStreamingRequest('{"stream": "true"}')).toBe(false);
     expect(isStreamingRequest('{"stream": 1}')).toBe(false);
     expect(isStreamingRequest('{"stream": null}')).toBe(false);
+  });
+});
+
+describe('prepareOutboundRequest', () => {
+  /** Provider stub that supports neither streamed usage nor sessions. */
+  const plainProvider: KeyProvider = {
+    ...opencodeGoProvider,
+    supportsStreamUsage: undefined,
+    sessionHeader: undefined,
+  };
+
+  function parse(body: string): Record<string, unknown> {
+    return JSON.parse(body) as Record<string, unknown>;
+  }
+
+  function prepare(body: string, modelId?: string, wantsStreamUsage = false, clientSessionId?: string) {
+    return prepareOutboundRequest(body, modelId, opencodeGoProvider, {
+      wantsStreamUsage,
+      clientSessionId,
+    });
+  }
+
+  it('asks for streamed usage on streaming requests', () => {
+    const { bodyText } = prepare(
+      '{"model":"m","stream":true,"messages":[]}',
+      'm',
+      true,
+    );
+    expect(parse(bodyText)).toEqual({
+      model: 'm',
+      stream: true,
+      messages: [],
+      stream_options: { include_usage: true },
+    });
+  });
+
+  it('leaves providers without stream-usage support alone', () => {
+    const input = '{"model":"m","stream":true}';
+    const prepared = prepareOutboundRequest(input, 'm', plainProvider, { wantsStreamUsage: true });
+    expect(prepared.bodyText).toBe(input);
+    expect(prepared.sessionId).toBeUndefined();
+  });
+
+  it('leaves non-streaming requests alone', () => {
+    const input = '{"model":"m","stream":false,"messages":[]}';
+    expect(prepare(input, 'm', false).bodyText).toBe(input);
+  });
+
+  it('honours an explicit client choice and merges otherwise', () => {
+    expect(parse(prepare(
+      '{"stream":true,"stream_options":{"include_usage":false}}', undefined, true,
+    ).bodyText).stream_options).toEqual({ include_usage: false });
+
+    expect(parse(prepare(
+      '{"stream":true,"stream_options":{"include_usage":true,"foo":1}}', undefined, true,
+    ).bodyText).stream_options).toEqual({ include_usage: true, foo: 1 });
+
+    expect(parse(prepare(
+      '{"stream":true,"stream_options":{"foo":1}}', undefined, true,
+    ).bodyText).stream_options).toEqual({ foo: 1, include_usage: true });
+
+    // Non-object stream_options is replaced, not merged.
+    expect(parse(prepare(
+      '{"stream":true,"stream_options":null}', undefined, true,
+    ).bodyText).stream_options).toEqual({ include_usage: true });
+  });
+
+  it('strips the provider routing suffix and injects usage in one pass', () => {
+    const { bodyText } = prepare(
+      '{"model":"deepseek-v4-flash@commandcode","stream":true}',
+      'deepseek-v4-flash@commandcode',
+      true,
+    );
+    expect(parse(bodyText)).toEqual({
+      model: 'deepseek-v4-flash',
+      stream: true,
+      stream_options: { include_usage: true },
+    });
+  });
+
+  it('returns bodies it cannot improve byte-identical', () => {
+    for (const input of ['', 'not json', '[1,2,3]', '{"stream":true}']) {
+      // No model to rewrite, nothing to inject, and no conversation to derive.
+      const prepared = prepareOutboundRequest(input, undefined, plainProvider, { wantsStreamUsage: false });
+      expect(prepared.bodyText).toBe(input);
+      expect(prepared.sessionId).toBeUndefined();
+    }
+  });
+
+  it('derives a stable session id for the same conversation', () => {
+    const turn1 = prepare('{"model":"m","messages":[{"role":"user","content":"hello"}]}', 'm');
+    const turn2 = prepare(
+      '{"model":"m","messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"},{"role":"user","content":"again"}]}',
+      'm',
+    );
+    expect(turn1.sessionId).toMatch(/^[0-9a-f]{32}$/);
+    expect(turn2.sessionId).toBe(turn1.sessionId);
+  });
+
+  it('keeps the session id stable when only the system prompt changes', () => {
+    const first = prepare(
+      '{"model":"m","messages":[{"role":"system","content":"now 12:00"},{"role":"user","content":"hello"}]}',
+      'm',
+    );
+    const second = prepare(
+      '{"model":"m","messages":[{"role":"system","content":"now 12:05"},{"role":"user","content":"hello"}]}',
+      'm',
+    );
+    expect(second.sessionId).toBe(first.sessionId);
+  });
+
+  it('derives different session ids for different conversations and models', () => {
+    const a = prepare('{"model":"m","messages":[{"role":"user","content":"one"}]}', 'm');
+    const b = prepare('{"model":"m","messages":[{"role":"user","content":"two"}]}', 'm');
+    const c = prepare('{"model":"other","messages":[{"role":"user","content":"one"}]}', 'other');
+    expect(a.sessionId).not.toBe(b.sessionId);
+    expect(a.sessionId).not.toBe(c.sessionId);
+  });
+
+  it('falls back to the message prefix when there is no user turn', () => {
+    const prepared = prepare('{"model":"m","messages":[{"role":"system","content":"ctx"}]}', 'm');
+    expect(prepared.sessionId).toMatch(/^[0-9a-f]{32}$/);
+    expect(prepare('{"model":"m","messages":[{"role":"system","content":"other"}]}', 'm').sessionId)
+      .not.toBe(prepared.sessionId);
+  });
+
+  it('never overrides a session id the client supplied', () => {
+    expect(prepare('{"model":"m","messages":[]}', 'm', false, 'client-session').sessionId).toBeUndefined();
   });
 });
 
@@ -332,6 +431,23 @@ describe('createProxyApp — standard proxy pipeline', () => {
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     const headers = init.headers as Headers;
     expect(headers.get('authorization')).toBe('Bearer sk-alpha-key-0001');
+  });
+
+  it('leaves non-streaming bodies byte-identical (no usage option injected)', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"ok":true}', { status: 200 }),
+    );
+    const app = createProxyApp(makeConfig());
+    const payload = JSON.stringify({ model: 'm', messages: [], stream: false });
+
+    await (await app.request('/v1/chat/completions', {
+      method: 'POST',
+      body: payload,
+      headers: { 'content-type': 'application/json' },
+    })).text();
+
+    // Exact equality: the body was neither re-serialized nor extended.
+    expect(String((fetchMock.mock.calls[0][1] as RequestInit).body)).toBe(payload);
   });
 
   it('returns sanitized client errors for 400 without penalising keys', async () => {
@@ -641,6 +757,114 @@ describe('createProxyApp — streaming pipeline', () => {
     expect(upstreamCancelled).toBe(true);
   });
 
+  it('asks the upstream for streamed token usage', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        sseStream(
+          'data: {"choices":[{"delta":{"content":"hi"}}],"usage":null}\n\n',
+          'data: {"choices":[{"delta":{}}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}\n\n',
+        ),
+        { status: 200 },
+      ),
+    );
+    const app = createProxyApp(makeConfig());
+    const res = await streamRequest(app);
+    const text = await res.text();
+
+    const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body)) as {
+      stream_options?: unknown;
+    };
+    expect(body.stream_options).toEqual({ include_usage: true });
+    // The client stream is untouched by the injected option.
+    expect(text).toContain('"content":"hi"');
+  });
+
+  it('books streamed usage once when the upstream repeats it', async () => {
+    resetTokenUsage();
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        sseStream(
+          'data: {"choices":[{"delta":{"content":"hi"}}],"usage":null}\n\n',
+          'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}\n\n',
+          'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}\n\n',
+          'data: [DONE]\n\n',
+        ),
+        { status: 200 },
+      ),
+    );
+    const app = createProxyApp(makeConfig());
+    await (await streamRequest(app)).text();
+
+    // CommandCode repeats the same counts on the finish chunk and the
+    // usage-only chunk; the key must be charged one request, not two.
+    const recorded = Object.values(getKeyTokenUsage().keys);
+    expect(recorded).toHaveLength(1);
+    expect(recorded[0]).toMatchObject({
+      requests: 1,
+      promptTokens: 5,
+      completionTokens: 2,
+      totalTokens: 7,
+    });
+  });
+
+  it('respects the client decision about streamed usage', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(sseStream('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'), { status: 200 }),
+    );
+    const app = createProxyApp(makeConfig());
+
+    // Explicit false → forwarded untouched.
+    await (await app.request('/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'm', stream: true, stream_options: { include_usage: false } }),
+      headers: { 'content-type': 'application/json' },
+    })).text();
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body)).stream_options)
+      .toEqual({ include_usage: false });
+
+    // Explicit true plus an extra option → both preserved, nothing re-injected.
+    await (await app.request('/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'm', stream: true, stream_options: { include_usage: true, foo: 1 } }),
+      headers: { 'content-type': 'application/json' },
+    })).text();
+    expect(JSON.parse(String((fetchMock.mock.calls[1][1] as RequestInit).body)).stream_options)
+      .toEqual({ include_usage: true, foo: 1 });
+  });
+
+  it('merges the usage option into client-supplied stream_options', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(sseStream('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'), { status: 200 }),
+    );
+    const app = createProxyApp(makeConfig());
+    await (await app.request('/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'm', stream: true, stream_options: { foo: 1 } }),
+      headers: { 'content-type': 'application/json' },
+    })).text();
+    expect(JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body)).stream_options)
+      .toEqual({ foo: 1, include_usage: true });
+  });
+
+  it('does not inject stream usage into non-chat streaming routes', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(sseStream('data: {"type":"x"}\n\n'), { status: 200 }),
+    );
+    const app = createProxyApp(makeConfig());
+
+    await (await app.request('/v1/responses', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'm', stream: true }),
+      headers: { 'content-type': 'application/json' },
+    })).text();
+
+    expect(String(fetchMock.mock.calls[0][0])).toBe('https://example.com/zen/go/v1/responses');
+    const body = JSON.parse(String((fetchMock.mock.calls[0][1] as RequestInit).body)) as {
+      stream_options?: unknown;
+    };
+    expect(body.stream_options).toBeUndefined();
+  });
+
   it('treats aborted streaming requests as timeouts', async () => {
     vi.useFakeTimers();
     try {
@@ -874,59 +1098,47 @@ describe('createProxyApp — provider mapping & extra headers', () => {
     expect(body.model).toBe('claude-opus-5');
   });
 
-  it('injects a stable x-opencode-session for opencode-go and keeps client values', async () => {
+  it('strips the provider suffix and asks for usage in one pass', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"ok":true}', { status: 200 }),
+      new Response(sseStream('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'), { status: 200 }),
     );
     const app = createProxyApp(makeConfig({
-      keys: [{ label: 'oc', key: 'oc_sk_key-0001', provider: 'opencode-go' }],
+      keys: [{ label: 'cc', key: 'user_cc-key-0001', provider: 'commandcode' }],
     }));
-    const firstTurn = JSON.stringify({
-      model: 'deepseek-v4.1-flash',
-      messages: [{ role: 'user', content: 'hello' }],
-    });
-    const secondTurn = JSON.stringify({
-      model: 'deepseek-v4.1-flash',
-      messages: [
-        { role: 'user', content: 'hello' },
-        { role: 'assistant', content: 'hi' },
-      ],
-    });
 
-    await app.request('/zen/go/v1/chat/completions', {
-      method: 'POST', body: firstTurn, headers: { 'content-type': 'application/json' },
-    });
-    await app.request('/zen/go/v1/chat/completions', {
-      method: 'POST', body: secondTurn, headers: { 'content-type': 'application/json' },
-    });
-
-    const headerOf = (call: number): string | null =>
-      (((fetchMock.mock.calls[call][1] as RequestInit).headers) as Headers).get('x-opencode-session');
-    expect(headerOf(0)).toMatch(/^saros-[0-9a-f]{32}$/);
-    expect(headerOf(1)).toBe(headerOf(0));
-
-    await app.request('/zen/go/v1/chat/completions', {
+    const res = await app.request('/zen/go/v1/chat/completions', {
       method: 'POST',
-      body: firstTurn,
-      headers: { 'content-type': 'application/json', 'x-opencode-session': 'client-session' },
+      body: JSON.stringify({ model: 'deepseek-v4-flash@commandcode', messages: [], stream: true }),
+      headers: { 'content-type': 'application/json' },
     });
-    expect(headerOf(2)).toBe('client-session');
+    await res.text();
+
+    // The provider catalog warm-up also hits fetch (no body) — pick the
+    // actual chat completion call.
+    const chatCall = fetchMock.mock.calls.find(([url]) =>
+      String(url).endsWith('/provider/v1/chat/completions'),
+    );
+    const body = JSON.parse(String((chatCall?.[1] as RequestInit | undefined)?.body)) as {
+      model: string;
+      stream_options?: unknown;
+    };
+    expect(body.model).toBe('deepseek-v4-flash');
+    expect(body.stream_options).toEqual({ include_usage: true });
   });
 
-  it('does not inject x-opencode-session on bodyless GET requests', async () => {
+  it('forwards an unparseable body untouched', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
-      new Response('{"ok":true}', { status: 200 }),
+      new Response(sseStream('data: [DONE]\n\n'), { status: 200 }),
     );
-    const app = createProxyApp(makeConfig({
-      keys: [{ label: 'oc', key: 'oc_sk_key-0001', provider: 'opencode-go' }],
-    }));
+    const app = createProxyApp(makeConfig());
 
-    const res = await app.request('/zen/go/v1/bodyless', { method: 'GET' });
+    await (await app.request('/v1/chat/completions', {
+      method: 'POST',
+      body: 'not json at all',
+      headers: { 'content-type': 'application/json' },
+    })).text();
 
-    expect(res.status).toBe(200);
-    const init = fetchMock.mock.calls[0][1] as RequestInit;
-    expect((init.headers as Headers).get('x-opencode-session')).toBeNull();
-    expect(init.body).toBeUndefined();
+    expect(String((fetchMock.mock.calls[0][1] as RequestInit).body)).toBe('not json at all');
   });
 
   it('handles a non-object JSON request body (JSON array)', async () => {
@@ -943,6 +1155,73 @@ describe('createProxyApp — provider mapping & extra headers', () => {
     expect(String(fetchMock.mock.calls[0][0])).toBe(
       'https://example.com/zen/go/v1/chat/completions',
     );
+  });
+});
+
+describe('createProxyApp — session header', () => {
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    resetModelsFetcherState();
+  });
+
+  function upstreamHeaders(call: unknown[]): Headers {
+    return (call[1] as RequestInit).headers as Headers;
+  }
+
+  it('derives a stable session id when the client sends none', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"ok":true}', { status: 200 }),
+    );
+    const app = createProxyApp(makeConfig());
+    const payload = { model: 'm', messages: [{ role: 'user', content: 'hi' }] };
+
+    for (let i = 0; i < 2; i++) {
+      await (await app.request('/v1/chat/completions', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+        headers: { 'content-type': 'application/json' },
+      })).text();
+    }
+
+    const first = upstreamHeaders(fetchMock.mock.calls[0]).get('x-opencode-session');
+    const second = upstreamHeaders(fetchMock.mock.calls[1]).get('x-opencode-session');
+    expect(first).toMatch(/^[0-9a-f]{32}$/);
+    expect(second).toBe(first);
+  });
+
+  it('forwards a client-supplied session id untouched', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"ok":true}', { status: 200 }),
+    );
+    const app = createProxyApp(makeConfig());
+
+    await (await app.request('/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+      headers: { 'content-type': 'application/json', 'x-opencode-session': 'client-session-1' },
+    })).text();
+
+    expect(upstreamHeaders(fetchMock.mock.calls[0]).get('x-opencode-session')).toBe('client-session-1');
+  });
+
+  it('adds no session header for providers that do not use one', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"ok":true}', { status: 200 }),
+    );
+    const app = createProxyApp(makeConfig({
+      keys: [{ label: 'cc', key: 'user_cc-key-0001', provider: 'commandcode' }],
+    }));
+
+    await (await app.request('/zen/go/v1/chat/completions', {
+      method: 'POST',
+      body: JSON.stringify({ model: 'm', messages: [{ role: 'user', content: 'hi' }] }),
+      headers: { 'content-type': 'application/json' },
+    })).text();
+
+    const chatCall = fetchMock.mock.calls.find(([url]) =>
+      String(url).endsWith('/provider/v1/chat/completions'),
+    );
+    expect(upstreamHeaders(chatCall as unknown[]).get('x-opencode-session')).toBeNull();
   });
 });
 

@@ -35,6 +35,9 @@ export const USAGE_PATH = '/zen/go/v1/usage';
 // Model request counters (persisted for `saros-proxy usage`)
 export const MODEL_STATS_SAVE_DEBOUNCE_MS = 5_000;
 
+// Per-key token counters (persisted for `saros-proxy usage`)
+export const TOKEN_USAGE_SAVE_DEBOUNCE_MS = 5_000;
+
 // models.dev canonical metadata
 export const MODELS_DEV_URL = 'https://models.dev/api.json';
 export const MODELS_DEV_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes

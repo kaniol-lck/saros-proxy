@@ -77,19 +77,44 @@ describe('fetchKeyUsage', () => {
 
   it('returns parsed usage on success', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(VALID_BODY, { status: 200 }));
-    const usage = await fetchKeyUsage('https://example.com', 'sk-test');
-    expect(usage?.usedPercent).toBe(92);
+    const result = await fetchKeyUsage('https://example.com', 'sk-test');
+    expect(result.usage?.usedPercent).toBe(92);
+    expect(result.noEntitlement).toBe(false);
   });
 
-  it('returns null on non-200, network error, or contract violation', async () => {
+  it('returns no usage on non-200, network error, or contract violation', async () => {
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}', { status: 500 }));
-    await expect(fetchKeyUsage('https://example.com', 'sk')).resolves.toBeNull();
+    await expect(fetchKeyUsage('https://example.com', 'sk')).resolves.toEqual({ usage: null, noEntitlement: false });
 
     vi.spyOn(globalThis, 'fetch').mockRejectedValue(new TypeError('fetch failed'));
-    await expect(fetchKeyUsage('https://example.com', 'sk')).resolves.toBeNull();
+    await expect(fetchKeyUsage('https://example.com', 'sk')).resolves.toEqual({ usage: null, noEntitlement: false });
 
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response('{}', { status: 200 }));
-    await expect(fetchKeyUsage('https://example.com', 'sk')).resolves.toBeNull();
+    await expect(fetchKeyUsage('https://example.com', 'sk')).resolves.toEqual({ usage: null, noEntitlement: false });
+  });
+
+  it('flags a 403 entitlement rejection but not a plan-gated model', async () => {
+    // opencode-go: account without a Go subscription
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(
+      JSON.stringify({ type: 'error', error: { type: 'EntitlementError', message: 'OpenCode Go subscription required.' } }),
+      { status: 403 },
+    ));
+    await expect(fetchKeyUsage('https://example.com', 'sk')).resolves.toEqual({
+      usage: null,
+      noEntitlement: true,
+    });
+
+    // commandcode: Go plan has no API access
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"error":{"code":"upgrade_required"}}', { status: 403 }),
+    );
+    await expect(fetchKeyUsage('https://example.com', 'sk')).resolves.toMatchObject({ noEntitlement: true });
+
+    // A model gated by the plan is a request problem, not an account one.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response('{"error":{"code":"MODEL_NOT_IN_PLAN"}}', { status: 403 }),
+    );
+    await expect(fetchKeyUsage('https://example.com', 'sk')).resolves.toEqual({ usage: null, noEntitlement: false });
   });
 
   it('sends the key as Bearer and hits the usage path', async () => {
@@ -179,5 +204,48 @@ describe('maybeRefreshUsage', () => {
     await settleMacrotasks();
 
     expect(state.keys[0].usagePercent).toBe(42);
+    // A transient failure must not change entitlement either.
+    expect(state.keys[0].entitled).toBe(true);
+  });
+
+  it('drops a key without a subscription and restores it when it works again', async () => {
+    const state = makeState();
+    const config = makeConfig();
+
+    // 'a' has no plan, 'b' is fine.
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const auth = (init as RequestInit).headers as Record<string, string>;
+      if (auth.Authorization.includes('sk-a')) {
+        return new Response(
+          JSON.stringify({ type: 'error', error: { type: 'EntitlementError', message: 'subscription required' } }),
+          { status: 403 },
+        );
+      }
+      return new Response(
+        JSON.stringify({ usage: { rolling: { percent: 20 }, weekly: {}, monthly: {} } }),
+        { status: 200 },
+      );
+    });
+
+    maybeRefreshUsage(state, config);
+    await settleMacrotasks();
+    await settleMacrotasks();
+
+    expect(state.keys.find((k) => k.label === 'a')?.entitled).toBe(false);
+    expect(state.keys.find((k) => k.label === 'b')?.entitled).toBe(true);
+
+    // Later the account is fixed → the next refresh puts it back in rotation.
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(
+        JSON.stringify({ usage: { rolling: { percent: 5 }, weekly: {}, monthly: {} } }),
+        { status: 200 },
+      ),
+    );
+    resetUsageRefreshState();
+    maybeRefreshUsage(state, config);
+    await settleMacrotasks();
+    await settleMacrotasks();
+
+    expect(state.keys.find((k) => k.label === 'a')?.entitled).toBe(true);
   });
 });

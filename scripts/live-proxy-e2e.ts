@@ -7,6 +7,7 @@
  */
 import { validateConfig } from '../src/config.js';
 import { createProxyApp } from '../src/proxy.js';
+import { getKeyTokenUsage } from '../src/token-usage.js';
 import { serve } from '@hono/node-server';
 import type { ServerType } from '@hono/node-server';
 
@@ -101,7 +102,15 @@ try {
   console.log('stream saw pong:', sawPong, '| saw [DONE]:', sawDone);
   const streamOk = sres.status === 200 && sawPong;
   console.log(streamOk ? 'LIVE STREAMING E2E PASSED' : 'LIVE STREAMING E2E FAILED');
-  process.exit(ok && streamOk ? 0 : 1);
+
+  // --- Token accounting: both responses must be booked against the key ---
+  const { keys } = getKeyTokenUsage();
+  const recorded = keys['live-cc'];
+  console.log('token usage for live-cc:', JSON.stringify(recorded));
+  const usageOk = Boolean(recorded && recorded.requests >= 2 && recorded.totalTokens > 0);
+  console.log(usageOk ? 'LIVE TOKEN ACCOUNTING PASSED' : 'LIVE TOKEN ACCOUNTING FAILED');
+
+  process.exit(ok && streamOk && usageOk ? 0 : 1);
 } finally {
   server.close();
   setTimeout(() => process.exit(0), 200).unref();

@@ -27,6 +27,15 @@ vi.mock('../model-stats.js', async (importOriginal) => {
   };
 });
 
+// token-usage also resolves through the real config dir — same treatment.
+vi.mock('../token-usage.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../token-usage.js')>();
+  return {
+    ...actual,
+    getTokenUsagePath: () => join(tmpRef.dir, 'token-usage.json'),
+  };
+});
+
 import { runUsageCommand } from './usage.js';
 import { loadConfig } from '../config.js';
 import type { ProxyConfig } from '../config.js';
@@ -217,6 +226,137 @@ describe('runUsageCommand', () => {
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     fetchSpy.mockRestore();
   });
+  it('shows token totals for a provider without a quota API', async () => {
+    mockConfigRef.config = makeConfig([
+      { label: 'cc', key: 'user_cc-key-abcdefghijklmnop', provider: 'commandcode' },
+    ]);
+    mkdirSync(tmpDir, { recursive: true });
+    writeFileSync(
+      join(tmpDir, 'token-usage.json'),
+      JSON.stringify({
+        since: Date.parse('2026-09-01T00:00:00Z'),
+        keys: {
+          cc: {
+            requests: 12,
+            promptTokens: 9_000,
+            completionTokens: 3_300,
+            totalTokens: 12_300,
+            lastAt: Date.now(),
+          },
+        },
+      }),
+      'utf-8',
+    );
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    const code = await runUsageCommand();
+    expect(code).toBe(0);
+    const out = log.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(out).toContain('usage: n/a — tokens: 12.3k (9k in / 3.3k out, 12 requests)');
+    expect(out).toContain('token totals since 2026-09-01');
+  });
+
+  it('appends token totals to quota lines and filters unusable entries', async () => {
+    mockConfigRef.config = makeConfig([{ label: 'alpha', key: 'sk-alpha' }]);
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(usageBody(42));
+    mkdirSync(tmpDir, { recursive: true });
+    writeFileSync(
+      join(tmpDir, 'token-usage.json'),
+      JSON.stringify({
+        since: 0,
+        keys: {
+          alpha: {
+            requests: 3,
+            promptTokens: 1_500,
+            completionTokens: 100,
+            totalTokens: 1_600,
+            lastAt: Date.now(),
+          },
+          // Never reported a request → not rendered.
+          ghost: { requests: 0, totalTokens: 9_999 },
+        },
+      }),
+      'utf-8',
+    );
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    const code = await runUsageCommand();
+    expect(code).toBe(0);
+    const out = log.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(out).toContain('42%');
+    expect(out).toContain('· tokens: 1.6k (1.5k in / 100 out, 3 requests)');
+    // No `since` in the file → no accumulation-window header.
+    expect(out).not.toContain('token totals since');
+  });
+
+  it('treats a corrupt token-usage file as empty without failing', async () => {
+    mockConfigRef.config = makeConfig([
+      { label: 'cc', key: 'user_cc-key-abcdefghijklmnop', provider: 'commandcode' },
+    ]);
+    mkdirSync(tmpDir, { recursive: true });
+    writeFileSync(join(tmpDir, 'token-usage.json'), '{broken json', 'utf-8');
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    const code = await runUsageCommand();
+    expect(code).toBe(0);
+    const out = log.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(out).toContain('usage: n/a — provider has no queryable usage API');
+  });
+
+  it('formats large and partial token totals', async () => {
+    mockConfigRef.config = {
+      ...makeConfig([{ label: 'alpha', key: 'sk-alpha' }]),
+      // Configured upstream override → quota fetch uses the mapped base URL.
+      upstreams: { 'opencode-go': 'https://override.example.com' },
+    };
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(usageBody(20));
+    mkdirSync(tmpDir, { recursive: true });
+    writeFileSync(
+      join(tmpDir, 'token-usage.json'),
+      JSON.stringify({
+        since: Date.parse('2026-09-02T00:00:00Z'),
+        keys: {
+          // Millions bucket, and token fields the file never wrote.
+          alpha: { requests: 40, totalTokens: 2_450_000, promptTokens: 2_000_000, completionTokens: 450_000 },
+          beta: { requests: 2 },
+        },
+      }),
+      'utf-8',
+    );
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    const code = await runUsageCommand();
+    expect(code).toBe(0);
+    const out = log.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(out).toContain('tokens: 2.5M (2M in / 450k out, 40 requests)');
+    expect(String(fetchSpy.mock.calls[0][0])).toBe('https://override.example.com/zen/go/v1/usage');
+  });
+
+  it('flags a key whose account has no plan for its provider', async () => {
+    mockConfigRef.config = makeConfig([
+      { label: 'gated', key: 'sk-gated' },
+      { label: 'alpha', key: 'sk-alpha' },
+    ]);
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_url, init) => {
+      const auth = (init as RequestInit).headers as Record<string, string>;
+      if (auth.Authorization.includes('sk-gated')) {
+        return new Response(
+          JSON.stringify({ type: 'error', error: { type: 'EntitlementError', message: 'subscription required' } }),
+          { status: 403 },
+        );
+      }
+      return usageBody(30);
+    });
+    const log = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+    const code = await runUsageCommand();
+    // A definitive "no subscription" answer is not a fetch failure.
+    expect(code).toBe(0);
+    const out = log.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(out).toContain('no subscription for this provider — excluded from rotation');
+    expect(out).toContain('30%');
+  });
+
   it('renders the models section when counts exist but since is absent', async () => {
     mockConfigRef.config = makeConfig([{ label: 'alpha', key: 'sk-alpha' }]);
     vi.spyOn(globalThis, 'fetch').mockResolvedValue(usageBody(42));

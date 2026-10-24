@@ -12,7 +12,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 // Isolate model-stats writes: these tests forward real HTTP requests and
 // must not pollute the user's ~/.config/saros/model-stats.json.
 process.env.XDG_CONFIG_HOME = mkdtempSync(join(tmpdir(), 'saros-e2e-'));
-import { createServer, type Server, type IncomingMessage } from 'node:http';
+import { createServer, type Server, type IncomingMessage, type IncomingHttpHeaders } from 'node:http';
 import { mkdtempSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -20,6 +20,7 @@ import { serve } from '@hono/node-server';
 import type { AddressInfo } from 'node:net';
 
 import { createProxyApp } from '../src/proxy.js';
+import { getKeyTokenUsage, resetTokenUsage } from '../src/token-usage.js';
 import { validateConfig } from '../src/config.js';
 import type { ProxyConfig } from '../src/config.js';
 
@@ -56,6 +57,7 @@ interface LogEntry {
   url: string;
   auth: string;
   body: string;
+  headers: IncomingHttpHeaders;
 }
 
 interface UpstreamControl {
@@ -87,7 +89,7 @@ function createMockUpstream(): { server: Server; control: UpstreamControl } {
     const method = req.method || '';
     const auth = req.headers['authorization'] || '';
 
-    requestLog.push({ method, url, auth, body });
+    requestLog.push({ method, url, auth, body, headers: req.headers });
 
     // Custom response by auth header (highest priority)
     if (customResponses.has(auth)) {
@@ -359,6 +361,12 @@ describe('1. Health & Status', () => {
     expect(body.circuitBreakerThreshold).toBe(3);
     expect(body.circuitBreakerCooldownMs).toBe(500);
     expect(typeof body.uptime).toBe('number');
+  });
+
+  it('health reports entitled keys (all of them by default)', async () => {
+    const res = await pf(proxy.port, '/health');
+    const body = await res.json() as { entitledCount: number; keyCount: number };
+    expect(body.entitledCount).toBe(body.keyCount);
   });
 
   it('health reflects disabled keys', async () => {
@@ -706,6 +714,82 @@ describe('5. Streaming Requests', () => {
     expect(res.headers.get('content-type')).toBe('text/event-stream');
     expect(res.headers.get('cache-control')).toBe('no-cache');
     expect(res.headers.get('connection')).toBe('keep-alive');
+  });
+
+  it('asks for streamed usage and books the counts against the serving key', async () => {
+    resetTokenUsage();
+    mockControl.setStreamChunks([
+      'data: {"choices":[{"delta":{"content":"Hello"}}],"usage":null}\n\n',
+      'data: {"choices":[{"delta":{"content":" world"}}]}\n\n',
+      'data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+        + '"usage":{"prompt_tokens":11,"completion_tokens":4,"total_tokens":15}}\n\n',
+      'data: [DONE]\n\n',
+    ]);
+
+    const res = await pf(proxy.port, '/zen/go/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: 'gpt-4',
+        messages: [{ role: 'user', content: 'Hello' }],
+        stream: true,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const keyLabel = res.headers.get('x-proxy-key-label') ?? '';
+    await collectStream(res);
+
+    // The proxy asked the upstream for the usage chunk itself...
+    const sent = mockControl.getRequestLog().at(-1);
+    const outbound = JSON.parse(sent?.body ?? '{}') as { stream_options?: unknown };
+    expect(outbound.stream_options).toEqual({ include_usage: true });
+
+    // ...and supplied the session id the upstream requires, since the client
+    // (this test) never sent one.
+    expect(String(sent?.headers['x-opencode-session'])).toMatch(/^[0-9a-f]{32}$/);
+
+    // ...and recorded the tokens against the key that served the request.
+    expect(getKeyTokenUsage().keys[keyLabel]).toMatchObject({
+      requests: 1,
+      promptTokens: 11,
+      completionTokens: 4,
+      totalTokens: 15,
+    });
+  });
+
+  it('forwards a client-supplied session id verbatim', async () => {
+    const res = await pf(proxy.port, '/zen/go/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-opencode-session': 'dsh-session-42' },
+      body: JSON.stringify({
+        model: 'gpt-4',
+        messages: [{ role: 'user', content: 'Hello' }],
+        stream: true,
+      }),
+    });
+    await collectStream(res);
+
+    const sent = mockControl.getRequestLog().at(-1);
+    expect(sent?.headers['x-opencode-session']).toBe('dsh-session-42');
+  });
+
+  it('books non-streaming token usage from the response body', async () => {
+    resetTokenUsage();
+
+    const res = await pf(proxy.port, '/zen/go/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: 'gpt-4', messages: [{ role: 'user', content: 'Hello' }] }),
+    });
+    const keyLabel = res.headers.get('x-proxy-key-label') ?? '';
+    await res.text();
+
+    expect(getKeyTokenUsage().keys[keyLabel]).toMatchObject({
+      requests: 1,
+      promptTokens: 10,
+      completionTokens: 3,
+      totalTokens: 13,
+    });
   });
 });
 

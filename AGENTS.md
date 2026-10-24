@@ -57,7 +57,11 @@ src/
 - **Failover:** Round-robin across API keys with automatic fallback on errors.
 - **Circuit breaker:** Per-key cooldown on 401/429/5xx. Lazy re-enable on next request.
 - **Streaming:** Detects `text/event-stream` responses and pipes chunks with failover.
-- **Security:** CORS origin whitelist, HTTPS-only upstream, key filtering (min 20 chars, `sk-` prefix).
+- **Token accounting:** Each forwarded response's `usage` (final SSE chunk for streams, top-level object otherwise) is booked per key label in `src/token-usage.ts` and persisted to `<config dir>/token-usage.json` with debounced atomic writes (mirrors `model-stats.ts`). Streaming requests get `stream_options.include_usage` injected when the provider advertises `supportsStreamUsage` and the client didn't set the option itself. Upstreams may repeat the same counts on several chunks (CommandCode: finish chunk + trailing usage-only chunk), so a stream is booked exactly once, preferring the usage-only chunk (`choices: []`).
+- **Session headers:** `KeyProvider.sessionHeader` (OpenCode-Go: `x-opencode-session`, required live — 400 `MissingSessionID` otherwise) is forwarded when the client sends it and derived from the conversation (model + first user turn, system prompt excluded) when it doesn't. Body prep for one attempt happens in a single JSON pass (`prepareOutboundRequest` in `proxy.ts`).
+- **Entitlement gating:** the usage refresh also classifies 403s that mean "account has no plan for this provider" (`src/usage-client.ts:isEntitlementError` — opencode-go `EntitlementError`, commandcode `upgrade_required`). Such keys get `entitled = false` in `ProxyState` (`setKeyEntitlement`) and are skipped by selection without touching the circuit breaker; a later refresh that returns usage flips them back. `/health` exposes `entitledCount`.
+- **Key identification:** `oc_sk_…` is minted only by OpenCode-Go → definitive `yes` without a network probe; `user_…` → CommandCode; legacy `sk-…` is shared between providers, so it stays ambiguous and identification falls back to the live read-only smoke test. Validation, paste extraction and `inferProvider` accept all three prefixes.
+- **Security:** CORS origin whitelist, HTTPS-only upstream, key filtering (min 20 chars; `oc_sk_`, `sk-` or `user_` prefix).
 - **Rate limiting:** Via `hono-rate-limiter` middleware.
 
 ## Known Issues & Gotchas

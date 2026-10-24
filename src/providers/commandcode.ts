@@ -169,6 +169,12 @@ export const commandcodeProvider: KeyProvider = {
     return null;
   },
 
+  // Documented contract (commandcode.ai/docs/provider §Streaming): every
+  // stream ends with a `usage` chunk, and stream_options.include_usage is the
+  // documented way to request it. saros reads those counts for per-key
+  // accounting — CommandCode exposes no quota API to poll.
+  supportsStreamUsage: true,
+
   extraUpstreamHeaders() {
     return commandcodeClientHeaders(cachedClientVersion ?? '0.18.10');
   },

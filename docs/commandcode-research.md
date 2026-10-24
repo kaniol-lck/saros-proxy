@@ -1,5 +1,32 @@
 # CommandCode API support for saros-proxy — Research Findings
 
+> **STATUS UPDATE (2026-09-20 — token usage implemented).** Per-key token
+> accounting landed (`src/token-usage.ts`): streaming requests to
+> providers that advertise `supportsStreamUsage` get
+> `stream_options: {include_usage: true}` injected (unless the client set the
+> option), the final SSE `usage` chunk and non-streaming `usage` objects are
+> booked against the serving key, and `saros-proxy usage` renders the totals
+> — CommandCode keys finally report consumption instead of a bare `usage: n/a`.
+> Verified live against opencode.ai (real key): every chunk carries a `usage`
+> key, `null` until the final chunk which reports
+> `{prompt_tokens, completion_tokens, total_tokens, …}`, with or without the
+> opt-in; the endpoint accepts `stream_options` (200) and now **requires an
+> `x-opencode-session` header** on chat requests (400 `MissingSessionID`
+> otherwise) — verified live again on 2026-09-20: the same request succeeds
+> through saros (which derives an id when the client sends none) and fails
+> with 400 when sent directly without the header. saros forwards a
+> client-supplied value untouched and derives a stable one from the
+> conversation otherwise (`KeyProvider.sessionHeader`).
+> CommandCode-side verification is still pending a live key: the stored
+> `user_…` token (dsh credentials + `~/.config/saros/config.yaml`) now returns
+> `401 UNAUTHORIZED` from both `/alpha/billing/subscriptions` and
+> `/provider/v1/chat/completions`, i.e. it was rotated or revoked after
+> 2026-08-29. The documented contract (`docs/provider` §Streaming: "Every
+> endpoint emits token usage at the end of every stream… No opt-in
+> required") plus the standard OpenAI chunk shape are what the parser
+> implements; re-run `scripts/live-proxy-e2e.ts` with a fresh key to confirm
+> end-to-end.
+>
 > Research date: 2026-08-29. All endpoints were probed live (no API key needed to
 > characterize the error contract). Sources: npm packages `opencommand-plugin`
 > 0.0.29 (bundles a Go proxy that speaks the CommandCode protocol) and

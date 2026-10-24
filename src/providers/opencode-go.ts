@@ -141,6 +141,16 @@ export const opencodeGoProvider: KeyProvider = {
     return parseOpencodeUsage(body);
   },
 
+  // Verified live (2026-09-20): the zen endpoint accepts
+  // stream_options.include_usage and every chunk carries a `usage` key
+  // (null until the final chunk, which reports the real counts).
+  supportsStreamUsage: true,
+
+  // Required by opencode.ai/docs/go ("Send a stable session ID in
+  // x-opencode-session for each conversation"); enforced live — chat
+  // requests without it fail with 400 MissingSessionID.
+  sessionHeader: 'x-opencode-session',
+
   /**
    * Affinity via the live catalog when loaded; 'maybe' before the first
    * fetch resolves (non-committal, keeps the key as rotation fallback).

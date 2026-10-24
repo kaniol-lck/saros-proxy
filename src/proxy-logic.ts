@@ -27,6 +27,14 @@ interface ApiKey {
   disabledAt: number | null; // C1: timestamp when key was disabled for cooldown
   /** Worst-window used percent (0-100) reported by the upstream usage API. */
   usagePercent: number | null;
+  /**
+   * False when the upstream rejected this key for lack of plan
+   * (403 EntitlementError / upgrade_required): the account cannot use the
+   * provider's models at all, so the key leaves rotation until the usage
+   * refresh sees it work again. Independent of the circuit breaker — this is
+   * not a transient fault.
+   */
+  entitled: boolean;
   /** Smooth weighted round-robin state (nginx-style). */
   currentWeight: number;
 }
@@ -102,6 +110,7 @@ export function createProxyState(
       lastUsed: null,
       disabledAt: null,
       usagePercent: null,
+      entitled: true,
       currentWeight: 0,
     })),
     currentIndex: 0,
@@ -129,6 +138,11 @@ function toSnapshot(key: ApiKey): KeySnapshot {
  * (C1 — fixes dead-code cooldown).
  */
 function isKeyAvailable(state: ProxyState, key: ApiKey): boolean {
+  // Entitlement is definitive, not transient: a key whose account has no
+  // plan for this provider must not be retried until the usage refresh
+  // clears the flag.
+  if (!key.entitled) return false;
+
   if (key.enabled && key.consecutiveFailures < state.circuitBreakerThreshold) {
     return true;
   }
@@ -244,6 +258,17 @@ export function updateKeyUsage(state: ProxyState, usage: Map<string, number>): v
     const percent = usage.get(key.label);
     if (typeof percent === 'number') key.usagePercent = percent;
   }
+}
+
+/**
+ * Mark a key as (not) entitled to use its provider. Unentitled keys are
+ * skipped by selection without touching the circuit breaker; the usage
+ * refresh flips the flag back as soon as the account can serve requests
+ * again.
+ */
+export function setKeyEntitlement(state: ProxyState, keyLabel: string, entitled: boolean): void {
+  const key = state.keys.find((k) => k.label === keyLabel);
+  if (key) key.entitled = entitled;
 }
 
 // ---------------------------------------------------------------------------

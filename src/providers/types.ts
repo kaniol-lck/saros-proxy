@@ -73,6 +73,25 @@ export interface KeyProvider {
   parseUsageResponse(body: string): KeyUsage | null;
 
   /**
+   * True when the provider accepts OpenAI's `stream_options.include_usage`
+   * and reports token counts for streamed responses. The proxy then asks
+   * for usage explicitly on streaming requests (unless the client set the
+   * option itself), so per-key token accounting stays accurate.
+   * Providers that reject unknown body fields must leave this unset.
+   */
+  readonly supportsStreamUsage?: boolean;
+
+  /**
+   * Header this provider uses to identify one conversation (upstream
+   * routing + prompt-cache optimization). saros forwards a client-supplied
+   * value untouched and derives a stable one from the conversation when the
+   * client sends none — some harnesses only send it on a subset of their
+   * request paths, and the upstream rejects the rest outright
+   * (OpenCode Go: 400 `MissingSessionID`).
+   */
+  readonly sessionHeader?: string;
+
+  /**
    * Extra headers this provider requires on upstream requests
    * (e.g. CommandCode CLI-identity headers). Called per request;
    * must not include Authorization (added by the proxy).

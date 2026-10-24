@@ -36,6 +36,7 @@ import {
 import { getModelsList } from './models-fetcher.js';
 import { maybeRefreshUsage } from './usage-client.js';
 import { recordModelRequest } from './model-stats.js';
+import { recordKeyTokens } from './token-usage.js';
 import { getProvider, inferProvider } from './providers/index.js';
 import type { KeyProvider, ProviderId } from './providers/index.js';
 
@@ -120,47 +121,95 @@ function captureFailedRequest(ctx: RetryContext, status: number, errorBody: stri
 }
 
 /**
- * Rewrite the model field inside a JSON request body. Returns the original
- * text unchanged when the body isn't valid JSON or has no model field.
+ * Resolve the model id to send upstream for one attempt. An '@provider'
+ * suffix is saros's routing shim and is always stripped; otherwise, when the
+ * serving provider names the same model differently (bare name matches its
+ * catalog under a vendor-prefixed id — e.g. 'deepseek-v4-flash' →
+ * 'deepseek/deepseek-v4-flash' on commandcode), the provider's native id is
+ * used so the upstream recognizes it. null when no rewrite is needed.
  */
-function rewriteModelInBody(bodyText: string, modelId: string): string {
-  try {
-    const parsed = JSON.parse(bodyText) as Record<string, unknown>;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return bodyText;
-    if (typeof parsed.model !== 'string') return bodyText;
-    parsed.model = modelId;
-    return JSON.stringify(parsed);
-  } catch {
-    return bodyText;
-  }
+function targetModelId(modelId: string | undefined, provider: KeyProvider): string | null {
+  if (!modelId) return null;
+  if (parseProviderSuffix(modelId)) return stripProviderSuffix(modelId);
+  const bare = modelId.split('/').pop() ?? modelId;
+  const native = provider.resolveNativeId?.(bare.toLowerCase());
+  return native && native !== modelId ? native : null;
+}
+
+/** Outbound body plus the session id saros must add when the client sent none. */
+export interface OutboundRequest {
+  bodyText: string;
+  /** Value for `provider.sessionHeader`; absent when the client supplied one. */
+  sessionId?: string;
 }
 
 /**
- * Rewrite a request's model id for the provider about to serve it.
- *
- * 1. '@provider' suffix → strip it (the suffix is saros's routing shim).
- * 2. Otherwise, when the serving provider names the same model differently
- *    (bare name matches its catalog under a vendor-prefixed id — e.g.
- *    'deepseek-v4-flash' → 'deepseek/deepseek-v4-flash' on commandcode),
- *    rewrite to the provider's native id so the upstream recognizes it.
- *    This is what makes cross-provider round-robin seamless: one id in,
- *    any of the serving keys out.
+ * Stable conversation fingerprint. The same conversation (same model, same
+ * first user turn) maps to the same id on every request, so upstream routing
+ * and prompt caching stay coherent, while a different conversation gets a
+ * different id. The system prompt is deliberately excluded: harnesses
+ * rewrite it on every turn (timestamps, injected context), which would make
+ * the id change per request and defeat the purpose.
  */
-function rewriteModelForProvider(
+function conversationSessionId(parsed: Record<string, unknown>, modelId: string | undefined): string {
+  const messages: unknown[] = Array.isArray(parsed.messages) ? parsed.messages : [];
+  const firstUser = messages.find(
+    (message) => typeof message === 'object' && message !== null && !Array.isArray(message)
+      && 'role' in message && message.role === 'user',
+  );
+  const seed = firstUser ?? messages.slice(0, 2);
+  return crypto
+    .createHash('sha256')
+    .update(`${modelId ?? String(parsed.model ?? '')}\n${JSON.stringify(seed).slice(0, 4_000)}`)
+    .digest('hex')
+    .slice(0, 32);
+}
+
+/**
+ * Prepare the outbound body for one attempt in a single JSON pass:
+ *  - rewrite the model id for the serving provider (see targetModelId);
+ *  - ask for streamed token usage (`stream_options.include_usage`) on chat
+ *    completions, unless the client set the option itself — an explicit
+ *    `false` is respected, otherwise the upstream may withhold the final
+ *    usage chunk and per-key token accounting goes blind;
+ *  - derive a conversation session id when the provider needs one and the
+ *    client didn't send it (see conversationSessionId).
+ *
+ * The original text is returned untouched when nothing changes (or the body
+ * isn't a JSON object), so most requests pay no re-serialization.
+ */
+export function prepareOutboundRequest(
   bodyText: string,
   modelId: string | undefined,
   provider: KeyProvider,
-): string {
-  if (!modelId) return bodyText;
-  if (parseProviderSuffix(modelId)) {
-    return rewriteModelInBody(bodyText, stripProviderSuffix(modelId));
+  options: { wantsStreamUsage: boolean; clientSessionId?: string },
+): OutboundRequest {
+  const parsed = parseRequestBody(bodyText);
+  if (!parsed) return { bodyText };
+  let changed = false;
+
+  const target = targetModelId(modelId, provider);
+  if (target && target !== parsed.model && typeof parsed.model === 'string') {
+    parsed.model = target;
+    changed = true;
   }
-  const bare = modelId.split('/').pop() ?? modelId;
-  const native = provider.resolveNativeId?.(bare.toLowerCase());
-  if (native && native !== modelId) {
-    return rewriteModelInBody(bodyText, native);
+
+  if (options.wantsStreamUsage && provider.supportsStreamUsage) {
+    const streamOptions = parsed.stream_options;
+    const existing = typeof streamOptions === 'object' && streamOptions !== null && !Array.isArray(streamOptions)
+      ? (streamOptions as Record<string, unknown>)
+      : undefined;
+    if (existing?.include_usage !== true && existing?.include_usage !== false) {
+      parsed.stream_options = { ...existing, include_usage: true };
+      changed = true;
+    }
   }
-  return bodyText;
+
+  const sessionId = provider.sessionHeader && !options.clientSessionId
+    ? conversationSessionId(parsed, modelId)
+    : undefined;
+
+  return { bodyText: changed ? JSON.stringify(parsed) : bodyText, sessionId };
 }
 
 /**
@@ -270,49 +319,6 @@ export function buildUpstreamHeaders(
   }
   headers.set('Authorization', `Bearer ${bearerToken}`);
   return headers;
-}
-
-/**
- * Stable per-conversation id for OpenCode-Go, which rejects requests
- * without `x-opencode-session` (routing + prompt-cache key).
- *
- * The first message is the conversation fingerprint — it does not change
- * across turns — hashed twice with FNV-1a 64-bit. Non-JSON bodies fall back
- * to a random id: presence is what the upstream requires.
- */
-export function deriveOpencodeSessionId(bodyText: string): string {
-  const fingerprint = conversationFingerprint(bodyText);
-  if (fingerprint === null) {
-    return `saros-${crypto.randomUUID().replaceAll('-', '').slice(0, 16)}`;
-  }
-  const first = fnv1a64(fingerprint);
-  const second = fnv1a64(`${fingerprint}\u0000saros`);
-  return `saros-${first.toString(16).padStart(16, '0')}${second.toString(16).padStart(16, '0')}`;
-}
-
-function conversationFingerprint(bodyText: string): string | null {
-  try {
-    const parsed = JSON.parse(bodyText) as { messages?: Array<{ content?: unknown }> };
-    const content = parsed?.messages?.[0]?.content;
-    if (typeof content === 'string') return content;
-    if (content !== undefined && content !== null) return JSON.stringify(content);
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-const FNV_OFFSET_BASIS = 0xcbf29ce484222325n;
-const FNV_PRIME = 0x100000001b3n;
-const UINT64_MASK = 0xffffffffffffffffn;
-
-function fnv1a64(input: string): bigint {
-  let hash = FNV_OFFSET_BASIS;
-  for (let i = 0; i < input.length; i++) {
-    hash ^= BigInt(input.charCodeAt(i));
-    hash = (hash * FNV_PRIME) & UINT64_MASK;
-  }
-  return hash;
 }
 
 /**
@@ -467,10 +473,26 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
   // in the forwarded body; the upstream never sees saros's routing shim.
   const provider = providerForKey(key, ctx.config, ctx.modelId);
   const upstreamUrl = resolveUpstreamUrl(ctx.config, provider, ctx.path);
-  const outboundBody = ctx.bodyText
-    ? rewriteModelForProvider(ctx.bodyText, ctx.modelId, provider)
-    : ctx.bodyText;
-  const fetchOptions = buildFetchOptions(ctx.method, outboundBody, ctx.kind, ctx.incomingHeaders, key.key, provider);
+  const sessionHeader = provider.sessionHeader;
+  const prepared = ctx.bodyText
+    ? prepareOutboundRequest(ctx.bodyText, ctx.modelId, provider, {
+        // `stream_options` is a Chat Completions field — never inject it into
+        // other streaming surfaces (e.g. the Responses API).
+        wantsStreamUsage: ctx.kind === 'streaming' && ctx.path.endsWith('/chat/completions'),
+        clientSessionId: sessionHeader
+          ? ctx.incomingHeaders.get(sessionHeader) ?? undefined
+          : undefined,
+      })
+    : { bodyText: ctx.bodyText };
+  const fetchOptions = buildFetchOptions({
+    method: ctx.method,
+    bodyText: prepared.bodyText,
+    kind: ctx.kind,
+    incomingHeaders: ctx.incomingHeaders,
+    bearerToken: key.key,
+    provider,
+    sessionId: prepared.sessionId,
+  });
 
   try {
     const response = await fetchWithTimeout(upstreamUrl, fetchOptions, ctx.config.requestTimeoutMs);
@@ -494,32 +516,35 @@ function pickKey(ctx: RetryContext, attempt: number): KeySnapshot | null {
     : failoverRequest(ctx.state, ctx.requestId);
 }
 
-function buildFetchOptions(
-  method: string,
-  bodyText: string,
-  kind: RequestKind,
-  incomingHeaders: Headers,
-  bearerToken: string,
-  provider?: KeyProvider,
-): RequestInit & { duplex?: 'half' } {
-  const headers = buildUpstreamHeaders(incomingHeaders, bearerToken);
+function buildFetchOptions(opts: {
+  method: string;
+  bodyText: string;
+  kind: RequestKind;
+  incomingHeaders: Headers;
+  bearerToken: string;
+  provider?: KeyProvider;
+  /** Derived conversation id, added only when the client sent none. */
+  sessionId?: string;
+}): RequestInit & { duplex?: 'half' } {
+  const headers = buildUpstreamHeaders(opts.incomingHeaders, opts.bearerToken);
   // Provider-specific identity headers (e.g. CommandCode CLI headers)
-  if (provider?.extraUpstreamHeaders) {
-    for (const [name, value] of Object.entries(provider.extraUpstreamHeaders())) {
+  if (opts.provider?.extraUpstreamHeaders) {
+    for (const [name, value] of Object.entries(opts.provider.extraUpstreamHeaders())) {
       headers.set(name, value);
     }
   }
-  // OpenCode-Go requires a stable session id; client-supplied values win
-  // (buildUpstreamHeaders forwards them verbatim).
-  if (provider?.id === 'opencode-go' && bodyText && !headers.has('x-opencode-session')) {
-    headers.set('x-opencode-session', deriveOpencodeSessionId(bodyText));
+  // Some upstreams require a stable per-conversation session id and reject
+  // requests without one (OpenCode Go: 400 MissingSessionID). A client that
+  // sends its own value keeps it — it was forwarded verbatim above.
+  if (opts.sessionId && opts.provider?.sessionHeader) {
+    headers.set(opts.provider.sessionHeader, opts.sessionId);
   }
-  const options: RequestInit & { duplex?: 'half' } = { method, headers };
-  if (!bodyText) return options;
+  const options: RequestInit & { duplex?: 'half' } = { method: opts.method, headers };
+  if (!opts.bodyText) return options;
   // Node.js fetch requires `duplex: 'half'` when body is a stream or string
   // that may be streamed. TypeScript's DOM RequestInit lacks this field.
-  if (kind === 'standard' && (method === 'GET' || method === 'HEAD')) return options;
-  options.body = bodyText;
+  if (opts.kind === 'standard' && (opts.method === 'GET' || opts.method === 'HEAD')) return options;
+  options.body = opts.bodyText;
   options.duplex = 'half';
   return options;
 }
@@ -674,6 +699,10 @@ const standardSuccessHandler: SuccessHandler = async (response, state, requestId
     'Upstream request succeeded',
   );
   const responseBody = await response.text();
+  // Non-streaming bodies report the request's token usage at the top level
+  // (OpenAI shape); recording it is what makes `saros-proxy usage` show real
+  // consumption for providers with no quota API (CommandCode).
+  recordKeyTokens(keyLabel, parseRequestBody(responseBody)?.usage);
   const downstreamHeaders = buildDownstreamHeaders(response.headers);
   downstreamHeaders.set('X-Proxy-Key-Label', keyLabel);
   downstreamHeaders.set('X-Proxy-Request-Id', requestId);
@@ -773,12 +802,28 @@ function wrapStreamWithErrorDetection(
   const encoder = new TextEncoder();
   let buffer = '';
 
+  // Upstreams may report the same `usage` on more than one chunk: CommandCode
+  // sends it on the finish chunk (`choices[0].finish_reason`) and again on the
+  // trailing usage-only chunk (`choices: []`), so booking per chunk would
+  // count every streamed request twice. Keep the canonical usage-only chunk
+  // (last one wins, OpenAI's `include_usage` contract) and fall back to the
+  // finish chunk's copy; book exactly once, when the stream ends.
+  let lastUsage: unknown = null;
+  let usageOnlyChunk: unknown = null;
+  let usageBooked = false;
+  const bookUsage = (): void => {
+    if (usageBooked) return;
+    usageBooked = true;
+    recordKeyTokens(keyLabel, usageOnlyChunk ?? lastUsage);
+  };
+
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const { done, value } = await reader.read();
 
         if (done) {
+          bookUsage();
           controller.close();
           return;
         }
@@ -800,6 +845,8 @@ function wrapStreamWithErrorDetection(
             if (parsed && (parsed.error || parsed.type === 'error')) {
               logger.warn({ requestId, keyLabel }, 'Error detected in stream');
               markKeyFailed(state, keyLabel, 'ServerFault');
+              // Whatever the upstream reported before failing was consumed.
+              bookUsage();
               controller.enqueue(
                 encoder.encode(
                   'data: {"type":"proxy_error","message":"Upstream stream error"}\n\n',
@@ -807,6 +854,14 @@ function wrapStreamWithErrorDetection(
               );
               controller.close();
               return;
+            }
+            // Intermediate chunks send `usage: null`; the counts arrive on the
+            // finish chunk and/or the usage-only chunk (see bookUsage).
+            if (parsed?.usage) {
+              lastUsage = parsed.usage;
+              if (Array.isArray(parsed.choices) && parsed.choices.length === 0) {
+                usageOnlyChunk = parsed.usage;
+              }
             }
           } catch {
             // Invalid JSON in SSE event — not an error we can classify, ignore
@@ -818,6 +873,7 @@ function wrapStreamWithErrorDetection(
       } catch (err) {
         logger.error({ requestId, keyLabel, err }, 'Stream read error');
         markKeyFailed(state, keyLabel, 'ServerFault');
+        bookUsage();
         controller.enqueue(
           encoder.encode(
             'data: {"type":"proxy_error","message":"Stream interrupted"}\n\n',
@@ -828,6 +884,8 @@ function wrapStreamWithErrorDetection(
     },
 
     cancel() {
+      // The client hung up, but the upstream already spent the tokens.
+      bookUsage();
       reader.cancel();
     },
   });
@@ -910,6 +968,9 @@ export function createProxyApp(config: ProxyConfig): Hono {
       keyCount: keys.length,
       enabledCount,
       disabledCount,
+      // Keys whose account has no plan for their provider (403 entitlement):
+      // kept out of rotation until the usage refresh clears the flag.
+      entitledCount: keys.filter((k) => k.entitled).length,
       activeRequests: activeCount,
       circuitBreakerThreshold: state.circuitBreakerThreshold,
       circuitBreakerCooldownMs: state.circuitBreakerCooldownMs,

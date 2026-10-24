@@ -104,6 +104,23 @@ not hard cutoffs, so neither key absorbs the full load when the other runs low.
 
 - Refreshed in the background every 60s (stale data keeps working).
 - Without usage data, falls back to even round-robin.
+- A key whose account has no plan for its provider (403 `EntitlementError` /
+  `upgrade_required` from the usage endpoint) is dropped from rotation without
+  tripping the circuit breaker, and returns as soon as a later refresh sees it
+  working. `/health` reports `entitledCount`.
+
+#### Token Accounting
+
+Every forwarded response's token usage is recorded per key: streaming requests
+get `stream_options: {"include_usage": true}` injected (unless the client set
+the option itself), and the final `usage` chunk — or the top-level `usage`
+object for non-streaming bodies — is booked against the key that served the
+request. Totals are persisted to `~/.config/saros/token-usage.json` (debounced
+atomic writes) and shown by `saros-proxy usage`.
+
+This is the only consumption signal available for providers without a
+queryable quota API (CommandCode): their keys report no percentages, but
+`saros-proxy usage` shows absolute token totals and request counts per key.
 
 #### Circuit Breaker
 
@@ -342,7 +359,8 @@ OPENCODE_GO_KEYS="account1:sk-xxx,cc:user_yyy"
 - Models uniquely named by a provider (e.g. `claude-*` or vendor-prefixed ids on CommandCode) are routed to a key of that provider first; other providers remain as fallback.
 - Synced harness configs may list provider-specific models as `model@commandcode`; the suffix selects the provider and is stripped before forwarding.
 - The `/health` endpoint reports per-provider key counts under `providers`.
-- Usage-based weighted rotation applies to providers with a queryable usage API (OpenCode-Go). CommandCode keys participate in rotation without usage data.
+- OpenCode-Go requires a stable per-conversation session id (`x-opencode-session`, used for routing and prompt caching). Saros forwards a client-supplied value untouched and derives one from the conversation (model + first user turn) when the client sends none — harnesses that only attach the header on some request paths would otherwise get `400 MissingSessionID`.
+- Usage-based weighted rotation applies to providers with a queryable usage API (OpenCode-Go). CommandCode keys participate in rotation without usage data, but their token consumption is tracked per key and shown by `saros-proxy usage` (see [Token Accounting](#token-accounting)).
 
 #### Smoke test (key identification)
 
@@ -453,7 +471,7 @@ saros-proxy probe [model-id]
 # Probe all models
 saros-proxy probe
 
-# Show per-key quota usage and most-used models
+# Show per-key quota usage, token totals and most-used models
 saros-proxy usage
 
 # Install autostart (Windows: VBS script or Registry)
@@ -492,7 +510,7 @@ saros-proxy probe [model-id]
 # Probe all configured models
 saros-proxy probe
 
-# Show per-key quota usage and most-used models
+# Show per-key quota usage, token totals and most-used models
 saros-proxy usage
 ```
 `sync-upstream` fetches the live model list from upstream and writes it to each enabled harness, with metadata from models.dev.

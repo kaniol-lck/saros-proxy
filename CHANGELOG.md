@@ -9,10 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-key token accounting** — the proxy now records the token usage every
+  forwarded response reports (the final SSE `usage` chunk for streams, the
+  top-level `usage` object for non-streaming bodies) and persists per-key
+  totals to `~/.config/saros/token-usage.json` (debounced atomic writes,
+  flushed on graceful shutdown). Streaming requests get
+  `stream_options: {include_usage: true}` injected unless the client already
+  set the option (an explicit `include_usage: false` is respected).
+- `saros-proxy usage` prints those totals per key: `· tokens: 1.2M (900k in /
+  300k out, 42 requests)` next to the quota windows, and replaces the bare
+  `usage: n/a` line for providers without a queryable quota API
+  (CommandCode) — token totals are the only consumption signal available
+  there.
 - **OpenCode-Go `oc_sk_…` keys** — accepted everywhere: `opencode-go.quickMatch`
   returns a definitive `yes` (CommandCode returns `no`, so identification no
   longer needs a network probe), pasted-key extraction matches the prefix, and
   config/setup validation accepts it. Legacy `sk-…` keys keep working.
+
+### Fixed
+
+- **Keys whose account has no plan for their provider are dropped from
+  rotation.** A 403 from the usage endpoint that says the account lacks the
+  subscription (`EntitlementError` on OpenCode-Go, `upgrade_required` on
+  CommandCode) now marks the key as unentitled: selection skips it without
+  touching the circuit breaker, and the next usage refresh puts it back as
+  soon as the account can serve requests again. Previously such a key stayed
+  in rotation and every request it served came back to the client as a 403
+  (`RequestFault` — no failover). `/health` reports `entitledCount`, and
+  `saros-proxy usage` labels the key `no subscription for this provider —
+  excluded from rotation`.
+- Requests that reach OpenCode-Go without an `x-opencode-session` header no
+  longer fail with `400 MissingSessionID`. Saros still forwards a
+  client-supplied value untouched, but now derives a stable id from the
+  conversation (model + first user turn) when the client sends none —
+  harnesses such as DeepSeek Harness only attach the header on some of their
+  request paths. The system prompt is excluded from the fingerprint, so a
+  per-turn rewrite (timestamps, injected context) doesn't change the id.
+- **Streamed token usage is booked once per request.** Upstreams may report
+  the same counts on more than one chunk (CommandCode sends `usage` on the
+  finish chunk and again on the trailing usage-only chunk with `choices: []`);
+  booking per chunk charged the key twice. The proxy now books a stream once,
+  preferring the usage-only chunk.
 
 ## [0.9.0] - 2026-08-29
 

@@ -14,7 +14,7 @@
 
 import { logger } from './logger.js';
 import { USAGE_FETCH_TIMEOUT_MS, USAGE_PATH, USAGE_REFRESH_TTL_MS } from './constants.js';
-import { updateKeyUsage, type ProxyState } from './proxy-logic.js';
+import { updateKeyUsage, setKeyEntitlement, type ProxyState } from './proxy-logic.js';
 import type { ProxyConfig } from './config.js';
 import { getProvider, inferProvider } from './providers/index.js';
 import type { ProviderId } from './providers/index.js';
@@ -28,6 +28,30 @@ export interface KeyUsage {
   rollingResetsAt?: string;
   weeklyResetsAt?: string;
   monthlyResetsAt?: string;
+}
+
+/** Outcome of one usage fetch. */
+export interface UsageFetchResult {
+  /** Parsed usage, or null when the fetch failed / violated the contract. */
+  usage: KeyUsage | null;
+  /**
+   * The upstream rejected the key for lack of plan (403 EntitlementError /
+   * upgrade_required). Definitive, not transient: the account cannot use this
+   * provider's models at all, so rotation drops the key until a later
+   * refresh shows it usable again.
+   */
+  noEntitlement: boolean;
+}
+
+/**
+ * 403 bodies that mean "this account has no plan for this provider":
+ * opencode-go → `{"error":{"type":"EntitlementError","message":"OpenCode Go
+ * subscription required."}}`, commandcode → `403 upgrade_required`.
+ * Plan-gated *models* (opencode-go's 403 `MODEL_NOT_IN_PLAN`) are a request
+ * problem, not an account one, and must not match.
+ */
+export function isEntitlementError(status: number, body: string): boolean {
+  return status === 403 && /subscription|entitlement|upgrade_required/i.test(body);
 }
 
 interface UsageWindow {
@@ -73,15 +97,16 @@ export function parseUsageResponse(body: string): KeyUsage {
 }
 
 /**
- * Fetch current usage for one key. Returns null on any failure
- * (network, timeout, non-200, contract violation) — callers treat null as
- * "no fresh data".
+ * Fetch current usage for one key. Failures (network, timeout, non-200,
+ * contract violation) yield `usage: null` — callers treat that as "no fresh
+ * data". A 403 entitlement rejection is reported separately because it is
+ * definitive rather than transient.
  */
 export async function fetchKeyUsage(
   upstreamBaseUrl: string,
   apiKey: string,
   usagePath: string = USAGE_PATH,
-): Promise<KeyUsage | null> {
+): Promise<UsageFetchResult> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), USAGE_FETCH_TIMEOUT_MS);
   try {
@@ -92,10 +117,17 @@ export async function fetchKeyUsage(
     // Keep the abort armed through the body read: a stalled body after a 200
     // must still time out, or refreshInFlight stays true forever and usage
     // rotation freezes on stale percentages.
-    if (!response.ok) return null;
-    return parseUsageResponse(await response.text());
+    const body = await response.text();
+    if (!response.ok) {
+      return { usage: null, noEntitlement: isEntitlementError(response.status, body) };
+    }
+    try {
+      return { usage: parseUsageResponse(body), noEntitlement: false };
+    } catch {
+      return { usage: null, noEntitlement: false };
+    }
   } catch {
-    return null;
+    return { usage: null, noEntitlement: false };
   } finally {
     clearTimeout(timer);
   }
@@ -139,10 +171,21 @@ export function maybeRefreshUsage(state: ProxyState, config: ProxyConfig): void 
           return [k.label, usage] as const;
         }),
       );
-      const usable = entries.filter(([, u]) => u !== null) as Array<[string, KeyUsage]>;
-      if (usable.length > 0) {
-        updateKeyUsage(state, new Map(usable.map(([label, u]) => [label, u.usedPercent])));
-        logger.debug({ keys: usable.map(([l]) => l) }, 'key usage refreshed');
+      const percents = new Map<string, number>();
+      for (const [label, result] of entries) {
+        if (!result) continue;
+        if (result.usage) {
+          percents.set(label, result.usage.usedPercent);
+          // A key that answers the usage API is entitled again.
+          setKeyEntitlement(state, label, true);
+        } else if (result.noEntitlement) {
+          setKeyEntitlement(state, label, false);
+        }
+        // Transient failures leave the previous entitlement untouched.
+      }
+      if (percents.size > 0) {
+        updateKeyUsage(state, percents);
+        logger.debug({ keys: [...percents.keys()] }, 'key usage refreshed');
       }
     } catch (err) {
       logger.debug({ err }, 'usage refresh failed');

@@ -281,7 +281,9 @@ Behavior worth telling the user:
 - Mixed pools work transparently: requests always use the OpenCode-Go URL shapes; CommandCode-routed requests are remapped internally (`/zen/go/v1/…` → `/provider/v1/…`).
 - CommandCode-only models (e.g. `claude-*`, vendor-prefixed ids) can appear in synced harness configs as `model@commandcode`.
 - `GET /health` reports per-provider key counts (`providers` object).
-- `saros-proxy usage` shows usage percentages for OpenCode-Go keys; CommandCode keys are listed as `usage: n/a` (no queryable usage API yet) — this is not an error.
+- OpenCode-Go requires a per-conversation session id (`x-opencode-session`). Saros forwards the client's value and derives a stable one when the client sends none, so harnesses that only attach it on some request paths keep working.
+- `saros-proxy usage` shows usage percentages for OpenCode-Go keys; CommandCode keys are listed as `usage: n/a` because the provider exposes no queryable quota API. Their **token totals** (recorded from each response's usage chunk) are shown on the same line — this is not an error.
+- Keys whose account has no plan for their provider are excluded from rotation until a later usage refresh clears them (`/health` → `entitledCount`; `saros-proxy usage` prints `no subscription for this provider — excluded from rotation`).
 - Key identification (which provider a pasted key belongs to) is done with cheap read-only pings: OpenCode-Go `GET /zen/go/v1/usage`, CommandCode `GET /alpha/billing/subscriptions` (also reports the plan). No tokens are spent.
 
 ---

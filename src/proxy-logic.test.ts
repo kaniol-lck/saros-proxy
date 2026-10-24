@@ -12,6 +12,7 @@ import {
   markKeyFailed,
   markKeySucceeded,
   classifyHttpError,
+  setKeyEntitlement,
   type ProxyState,
   type ErrorType,
 } from './proxy-logic.js';
@@ -731,6 +732,34 @@ describe('updateKeyUsage + weighted selection', () => {
       completeRequest(state, `req-${i}`, true);
       expect(key.label).toBe('y');
     }
+  });
+});
+
+describe('setKeyEntitlement (no plan for the provider)', () => {
+  it('keeps an unentitled key out of rotation without tripping the breaker', () => {
+    const state = createProxyState(
+      [{ label: 'x', key: 'sk-x' }, { label: 'y', key: 'sk-y' }],
+    );
+    setKeyEntitlement(state, 'x', false);
+
+    for (let i = 0; i < 4; i++) {
+      const key = selectKeyForRequest(state, `req-${i}`)!;
+      completeRequest(state, `req-${i}`, true);
+      expect(key.label).toBe('y');
+    }
+    // The excluded key is untouched by the circuit breaker.
+    const x = state.keys.find((k) => k.label === 'x')!;
+    expect(x.enabled).toBe(true);
+    expect(x.consecutiveFailures).toBe(0);
+  });
+
+  it('serves nothing when every key lacks a plan, and recovers when one returns', () => {
+    const state = createProxyState([{ label: 'x', key: 'sk-x' }]);
+    setKeyEntitlement(state, 'x', false);
+    expect(selectKeyForRequest(state, 'req-0')).toBeNull();
+
+    setKeyEntitlement(state, 'x', true);
+    expect(selectKeyForRequest(state, 'req-1')?.label).toBe('x');
   });
 });
 
