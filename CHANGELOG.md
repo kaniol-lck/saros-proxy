@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-24
+
 ### Added
 
 - **Per-key token accounting** — the proxy now records the token usage every
@@ -214,6 +216,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hop-by-hop header sanitization
 - Non-root Docker user
 
-[Unreleased]: https://github.com/vitorvilaca3011/saros-proxy/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/vitorvilaca3011/saros-proxy/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/vitorvilaca3011/saros-proxy/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/vitorvilaca3011/saros-proxy/compare/v0.8.0...v0.9.0
 [0.8.0]: https://github.com/vitorvilaca3011/saros-proxy/releases/tag/v0.8.0
