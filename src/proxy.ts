@@ -166,6 +166,31 @@ function conversationSessionId(parsed: Record<string, unknown>, modelId: string 
 }
 
 /**
+ * [dsh-patch param-sanitize] 上游只接受固定几个 reasoning_effort 值，
+ * 其它值（harness 自造、大小写变体）会被 400 拒绝。白名单外的直接删掉，
+ * 让上游按默认档位处理，而不是让整轮请求失败。
+ */
+const ALLOWED_REASONING_EFFORTS = new Set(['off', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+function sanitizeReasoningEffort(parsed: Record<string, unknown>): boolean {
+  let changed = false;
+  const top = parsed.reasoning_effort;
+  if (typeof top === 'string' && !ALLOWED_REASONING_EFFORTS.has(top.toLowerCase())) {
+    delete parsed.reasoning_effort;
+    changed = true;
+  }
+  const reasoning = parsed.reasoning;
+  if (typeof reasoning === 'object' && reasoning !== null && !Array.isArray(reasoning)) {
+    const record = reasoning as Record<string, unknown>;
+    if (typeof record.effort === 'string' && !ALLOWED_REASONING_EFFORTS.has(record.effort.toLowerCase())) {
+      delete record.effort;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+/**
  * Prepare the outbound body for one attempt in a single JSON pass:
  *  - rewrite the model id for the serving provider (see targetModelId);
  *  - ask for streamed token usage (`stream_options.include_usage`) on chat
@@ -193,6 +218,9 @@ export function prepareOutboundRequest(
     parsed.model = target;
     changed = true;
   }
+
+  // [dsh-patch param-sanitize] 清理上游不接受的值
+  if (sanitizeReasoningEffort(parsed)) changed = true;
 
   if (options.wantsStreamUsage && provider.supportsStreamUsage) {
     const streamOptions = parsed.stream_options;
@@ -494,15 +522,28 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     sessionId: prepared.sessionId,
   });
 
+  // [dsh-patch req-metrics] 面板需要"每次请求"的 model / 耗时 / 请求体大小
+  const attemptStartedAt = Date.now();
   try {
     const response = await fetchWithTimeout(upstreamUrl, fetchOptions, ctx.config.requestTimeoutMs);
     if (response.ok) {
       markKeySucceeded(ctx.state, key.label);
       completeRequest(ctx.state, ctx.requestId, true);
-      return {
-        kind: 'done',
-        response: await ctx.onSuccess(response, ctx.state, ctx.requestId, key.label),
-      };
+      const downstream = await ctx.onSuccess(response, ctx.state, ctx.requestId, key.label);
+      logger.info(
+        {
+          requestId: ctx.requestId,
+          keyLabel: key.label,
+          model: ctx.modelId,
+          kind: ctx.kind,
+          status: response.status,
+          attempt,
+          durationMs: Date.now() - attemptStartedAt,
+          bodyBytes: ctx.bodyText.length,
+        },
+        'request metrics',
+      );
+      return { kind: 'done', response: downstream };
     }
     return await handleUpstreamErrorResponse(response, ctx, key);
   } catch (err) {
@@ -510,10 +551,46 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
   }
 }
 
+/**
+ * [dsh-patch failover-affinity] 判断某 provider 能否服务这个 model id。
+ *
+ * 只对"必须把裸名改写成 provider 原生 id、却解析不出来"的情况否决：
+ * commandcode 需要 deepseek-v4.1-flash → deepseek/deepseek-v4.1-flash，目录未加载
+ * 或目录里没有该模型时改不出来，发过去就是 400
+ * 「Model ... is not supported on this endpoint」（RequestFault 不重试，直接透传）。
+ * 其它 provider（如 opencode-go）没有原生 id 改写，一律放行——它们的 catalog 可能
+ * 还没加载，用 affinity 'no' 否决会误伤正常的 failover。
+ */
+function providerCanServe(provider: KeyProvider, modelId: string | undefined): boolean {
+  if (!provider || !modelId) return true;
+  if (provider.modelAffinity(modelId) === 'yes') return true;
+  if (parseProviderSuffix(modelId)) return true;
+  // 只有"必须把裸名改写成 vendor 前缀原生 id"的 provider 才做硬性否决
+  // （commandcode: deepseek-v4.1-flash → deepseek/deepseek-v4.1-flash）。
+  // opencode-go 的裸名本身就是原生 id，resolveNativeId 为 null 不代表不能服务，
+  // 拿它否决会把正常 failover 打死（503 No keys available）。
+  if (provider.id !== 'commandcode') return true;
+  const resolveNativeId = provider.resolveNativeId;
+  if (!resolveNativeId) return true;
+  const bare = (modelId.split('/').pop() ?? modelId).toLowerCase();
+  return resolveNativeId.call(provider, bare) !== null;
+}
+
 function pickKey(ctx: RetryContext, attempt: number): KeySnapshot | null {
-  return attempt === 0
-        ? selectKeyForRequest(ctx.state, ctx.requestId, ctx.modelId)
-    : failoverRequest(ctx.state, ctx.requestId);
+  if (attempt === 0) return selectKeyForRequest(ctx.state, ctx.requestId, ctx.modelId);
+  // [dsh-patch failover-affinity] 逐个取候选，跳过"该 provider 服务不了此 model"的 key，
+  // 避免把裸 id 发到 commandcode 换来 400（RequestFault 不会重试，直接透传给客户端）。
+  for (let i = 0; i < 8; i++) {
+    const next = failoverRequest(ctx.state, ctx.requestId);
+    if (!next) return null;
+    const provider = providerForKey(next, ctx.config, ctx.modelId);
+    if (providerCanServe(provider, ctx.modelId)) return next;
+    logger.warn(
+      { requestId: ctx.requestId, keyLabel: next.label, model: ctx.modelId, provider: provider.id },
+      'skip failover key: provider cannot serve this model',
+    );
+  }
+  return null;
 }
 
 function buildFetchOptions(opts: {
@@ -907,6 +984,10 @@ export function createProxyApp(config: ProxyConfig): Hono {
   // cross-provider. No-op for single-provider pools and when no provider
   // claims the model.
   state.affinityResolver = (providerId, modelId) => {
+    // [dsh-patch] 显式钉住（model@provider）优先于目录亲和：客户端已经指明 provider，
+    // 不能因为该 provider 的 catalog 还没加载（冷启动返回 'no'）就拒绝服务。
+    const pinned = parseProviderSuffix(modelId);
+    if (pinned && pinned === providerId) return 'yes';
     const provider = getProvider(providerId as ProviderId);
     if (!provider) return 'maybe';
     const direct = provider.modelAffinity(modelId);
@@ -991,6 +1072,22 @@ export function createProxyApp(config: ProxyConfig): Hono {
   // NOTE: Rate limiting applies to these routes via the '*' middleware above.
   app.get('/v1/models', (_c: Context) => getModelsList(config));
   app.get('/zen/go/v1/models', (_c: Context) => getModelsList(config));
+
+  // [dsh-patch models-single] 单模型查询在本地回 404：客户端（含 DSH）会探测
+  // /models/<id>，透传到上游只会换来一串 404 噪音（实测一天 133 次）。
+  const modelNotFound = (c: Context): Response =>
+    c.json(
+      {
+        error: {
+          message: `Model '${c.req.param('id') ?? ''}' not found`,
+          type: 'invalid_request_error',
+          code: 'model_not_found',
+        },
+      },
+      404,
+    );
+  app.get('/v1/models/:id', modelNotFound);
+  app.get('/zen/go/v1/models/:id', modelNotFound);
 
   // --- Upstream proxy handler (reused by both routes) ---
   async function handleProxyRequest(c: Context, path: string): Promise<Response> {

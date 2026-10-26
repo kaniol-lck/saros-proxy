@@ -18,10 +18,13 @@ export const DEFAULT_UPSTREAM_URL = 'https://opencode.ai';
 // Chat route prefixes live on the provider adapters (chatBasePath).
 export const DEFAULT_UPSTREAM_OPENCODE_GO = DEFAULT_UPSTREAM_URL;
 export const DEFAULT_UPSTREAM_COMMANDCODE = 'https://api.commandcode.ai';
-export const MAX_BODY_SIZE = 10 * 1024 * 1024;
+// [dsh-patch] 上限可被环境变量覆盖：长上下文会话的请求体常到 3–8MB，
+// 生产用 MAX_BODY_SIZE_BYTES=67108864（64MB）；不设置时保持上游默认 10MB。
+export const MAX_BODY_SIZE = Number(process.env.MAX_BODY_SIZE_BYTES) || 10 * 1024 * 1024;
 export const MAX_RETRIES = 2;
 export const RATE_LIMIT_WINDOW_MS = 60_000;
-export const RATE_LIMIT_MAX = 100;
+// [dsh-patch] 单机多 agent 并发时 100/min 会误伤；生产用 RATE_LIMIT_MAX=600 覆盖。
+export const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 100;
 export const FORCE_SHUTDOWN_TIMEOUT_MS = 5_000;
 export const MAX_STREAMING_BUFFER = 10_000;
 export const MODELS_FETCH_TIMEOUT_MS = 5_000;

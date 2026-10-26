@@ -223,6 +223,25 @@ function findNextKey(
  * Falls back to the first candidate (round-robin order) when usage data is
  * missing for any candidate or when no candidate has remaining capacity.
  */
+/**
+ * [dsh-patch provider-weight-factor] 按 provider 质量系数缩放额度权重。
+ * env: PROVIDER_WEIGHT_FACTOR="commandcode=0.55,opencode-go=1"
+ * 保留跨 provider 分流与故障转移，只是让成功率低的 provider 少分流量。
+ */
+let providerWeightFactors: Record<string, number> | null = null;
+
+function getProviderWeightFactors(): Record<string, number> {
+  if (providerWeightFactors) return providerWeightFactors;
+  const factors: Record<string, number> = {};
+  for (const part of (process.env.PROVIDER_WEIGHT_FACTOR ?? '').split(',')) {
+    const [id, raw] = part.split('=');
+    const value = Number(raw);
+    if (id && Number.isFinite(value) && value >= 0) factors[id.trim()] = value;
+  }
+  providerWeightFactors = factors;
+  return factors;
+}
+
 function pickWeighted(state: ProxyState, candidates: ApiKey[]): ApiKey {
   const known = candidates.filter((k) => k.usagePercent !== null);
   if (known.length === 0) return candidates[0];
@@ -233,6 +252,14 @@ function pickWeighted(state: ProxyState, candidates: ApiKey[]): ApiKey {
   const sorted = known.map((k) => 100 - (k.usagePercent ?? 0)).sort((a, b) => a - b);
   const median = sorted[Math.floor(sorted.length / 2)] ?? 0;
   weights = weights.map((w, i) => (candidates[i].usagePercent === null ? median : w));
+  // [dsh-patch provider-weight-factor] 质量系数（1 = 不调整）
+  const factors = getProviderWeightFactors();
+  if (Object.keys(factors).length > 0) {
+    weights = weights.map((w, i) => {
+      const factor = factors[candidates[i].provider];
+      return factor === undefined ? w : Math.max(1, Math.round(w * factor));
+    });
+  }
   const totalWeight = weights.reduce((sum, w) => sum + w, 0);
   if (totalWeight === 0) return candidates[0];
 

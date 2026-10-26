@@ -227,18 +227,22 @@ export const commandcodeProvider: KeyProvider = {
   /**
    * Bare-name affinity against the live catalog: 'deepseek-v4-flash' matches
    * the catalog entry 'deepseek/deepseek-v4-flash' (last path segment).
-   * Cached after the first catalog fetch; 'maybe' until the catalog loads.
+   * Cached after the first catalog fetch; 'no' until the catalog loads.
    */
   modelAffinityByName(bareName: string): 'yes' | 'no' | 'maybe' {
     if (catalogCache) {
       return catalogCache.bareNames.has(bareName.toLowerCase()) ? 'yes' : 'no';
     }
-    // Warm the cache in the background (once per process); stay non-committal meanwhile.
+    // Warm the cache in the background (once per process).
     if (!warmupStarted) {
       warmupStarted = true;
       void commandcodeProvider.fetchCatalog?.();
     }
-    return 'maybe';
+    // [dsh-patch cc-affinity-cold-start] 目录未加载时必须明确回答 'no'：
+    // 此时 resolveNativeId 返回 null，targetModelId 不会把裸名改写成 cc 原生 id，
+    // 选到 cc 就会把 'deepseek-v4.1-flash' 原样发过去，上游回
+    // 400「Model ... is not supported on this endpoint」。等目录就绪再参与分流。
+    return 'no';
   },
 
   /**

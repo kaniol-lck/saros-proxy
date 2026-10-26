@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`PROVIDER_WEIGHT_FACTOR`** (e.g. `commandcode=0.55,opencode-go=1`) scales the
+  quota-based rotation weight per provider, so a provider with a lower observed
+  success rate gets a smaller share while staying in rotation for failover.
+- **Request metrics log line** (`request metrics`) with `model`, `kind`,
+  `status`, `attempt`, `durationMs` and `bodyBytes` on every successful attempt,
+  for dashboards that chart latency and request sizes.
+- **`MAX_BODY_SIZE_BYTES` / `RATE_LIMIT_MAX` env overrides** for the body-size
+  limit and the rate limiter (defaults unchanged: 10MB / 100 per minute).
+- `GET /v1/models/:id` and `/zen/go/v1/models/:id` answer `404 model_not_found`
+  locally instead of forwarding single-model probes upstream.
+
+### Changed
+
+- **CommandCode bare-name affinity is `no` while its catalog is cold** (was
+  `maybe`). With `maybe`, a key could be picked before `resolveNativeId` could
+  rewrite the bare name (`deepseek-v4.1-flash` → `deepseek/deepseek-v4.1-flash`),
+  and the upstream answered `400 Model ... is not supported on this endpoint`.
+  Explicit `model@provider` pins still win over affinity.
+- **Failover skips keys whose provider cannot serve the model**: when the
+  serving provider needs a native-id rewrite and cannot produce one (CommandCode
+  with a cold or unknown catalog), the candidate is skipped and the next one is
+  tried instead of sending a request that is guaranteed to 400.
+- Invalid `reasoning_effort` values (top-level or under `reasoning.effort`) are
+  dropped instead of being forwarded, since upstreams reject unknown values with
+  a 400.
+
 ## [0.10.1] - 2026-10-24
 
 ### Changed

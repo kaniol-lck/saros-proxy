@@ -81,7 +81,10 @@ describe('commandcode model catalog & affinity', () => {
     expect(commandcodeProvider.modelAffinity('glm-5')).toBe('maybe');
   });
 
-  it('modelAffinityByName stays non-committal while the catalog is not loaded', async () => {
+  it('modelAffinityByName says no while the catalog is not loaded', async () => {
+    // [dsh-patch cc-affinity-cold-start] 目录未加载时明确回答 'no'：此时
+    // resolveNativeId 返回 null，裸名改不成 cc 原生 id，选到 cc 会把裸 id
+    // 发过去，上游回 400「Model ... is not supported on this endpoint」。
     // Must run before fetchCatalog populates the module cache (order matters).
     // The background warm-up must fail cleanly so the cache stays null.
     vi.stubGlobal(
@@ -90,7 +93,7 @@ describe('commandcode model catalog & affinity', () => {
         throw new Error('offline');
       }),
     );
-    expect(commandcodeProvider.modelAffinityByName('deepseek-v4-flash')).toBe('maybe');
+    expect(commandcodeProvider.modelAffinityByName('deepseek-v4-flash')).toBe('no');
     // Let the background warm-up settle (rejected) before later tests run.
     await new Promise((resolve) => setTimeout(resolve, 10));
   });
