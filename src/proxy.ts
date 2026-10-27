@@ -725,6 +725,23 @@ function logKeyAttempt(requestId: string, key: KeySnapshot, attempt: number, kin
   );
 }
 
+/**
+ * [dsh-patch req-tokens] 从上游 `usage` 对象里取 token 计数（OpenAI 形状与
+ * Anthropic 形状都兼容），供面板按小时聚合 token 用量。
+ */
+function tokenCounts(usage: unknown): { tokIn: number; tokOut: number } | null {
+  if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return null;
+  const record = usage as Record<string, unknown>;
+  const pick = (a: string, b: string): number | null => {
+    const value = record[a] ?? record[b];
+    return typeof value === 'number' && Number.isFinite(value) ? value : null;
+  };
+  const tokIn = pick('prompt_tokens', 'input_tokens');
+  const tokOut = pick('completion_tokens', 'output_tokens');
+  if (tokIn === null && tokOut === null) return null;
+  return { tokIn: tokIn ?? 0, tokOut: tokOut ?? 0 };
+}
+
 function logUpstreamError(
   requestId: string,
   key: KeySnapshot,
@@ -732,8 +749,7 @@ function logUpstreamError(
   errorType: string,
   errorBody: string,
   kind: RequestKind,
-): void {
-  if (kind === 'standard') {
+): void {  if (kind === 'standard') {
     logger.warn(
       { requestId, keyLabel: key.label, status, errorType, kind },
       'Upstream returned error: %s',
@@ -779,7 +795,11 @@ const standardSuccessHandler: SuccessHandler = async (response, state, requestId
   // Non-streaming bodies report the request's token usage at the top level
   // (OpenAI shape); recording it is what makes `saros-proxy usage` show real
   // consumption for providers with no quota API (CommandCode).
-  recordKeyTokens(keyLabel, parseRequestBody(responseBody)?.usage);
+  const usage = parseRequestBody(responseBody)?.usage;
+  recordKeyTokens(keyLabel, usage);
+  // [dsh-patch req-tokens] 逐请求 token 进日志（面板按小时聚合）
+  const counts = tokenCounts(usage);
+  if (counts) logger.info({ requestId, keyLabel, tokIn: counts.tokIn, tokOut: counts.tokOut }, 'request tokens');
   const downstreamHeaders = buildDownstreamHeaders(response.headers);
   downstreamHeaders.set('X-Proxy-Key-Label', keyLabel);
   downstreamHeaders.set('X-Proxy-Request-Id', requestId);
@@ -891,7 +911,11 @@ function wrapStreamWithErrorDetection(
   const bookUsage = (): void => {
     if (usageBooked) return;
     usageBooked = true;
-    recordKeyTokens(keyLabel, usageOnlyChunk ?? lastUsage);
+    const usage = usageOnlyChunk ?? lastUsage;
+    recordKeyTokens(keyLabel, usage);
+    // [dsh-patch req-tokens] 流式请求在结束时把 token 记进日志
+    const counts = tokenCounts(usage);
+    if (counts) logger.info({ requestId, keyLabel, tokIn: counts.tokIn, tokOut: counts.tokOut }, 'request tokens');
   };
 
   return new ReadableStream<Uint8Array>({
