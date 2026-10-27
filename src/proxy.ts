@@ -263,6 +263,39 @@ declare module 'hono' {
 }
 
 // ---------------------------------------------------------------------------
+// [dsh-patch proxy-fallback] opencode 兜底代理
+// ---------------------------------------------------------------------------
+
+let proxyAgentCache: unknown = null;
+let proxyAgentInitDone = false;
+
+/** Lazily build an undici ProxyAgent from OPENCODE_PROXY (http(s) only, no socks). */
+async function getProxyAgent(): Promise<unknown> {
+  if (proxyAgentInitDone) return proxyAgentCache;
+  proxyAgentInitDone = true;
+  const url = process.env.OPENCODE_PROXY;
+  if (!url) return null;
+  try {
+    const undici = await import('undici');
+    proxyAgentCache = new undici.ProxyAgent(url);
+    logger.info({ proxy: url.replace(/\/\/[^@/]*@/, '//***@') }, 'opencode proxy agent ready');
+  } catch (err) {
+    logger.warn({ err: String((err as Error)?.message ?? err).slice(0, 160) }, 'opencode proxy agent init failed');
+  }
+  return proxyAgentCache;
+}
+
+/** Network-level failures worth retrying through the proxy. */
+function isNetworkishError(err: unknown): boolean {
+  const message = String((err as Error)?.message ?? err ?? '');
+  const cause = String(((err as { cause?: { code?: string; message?: string } })?.cause?.code
+    ?? (err as { cause?: { message?: string } })?.cause?.message) ?? '');
+  const text = (message + ' ' + cause).toLowerCase();
+  return ['fetch failed', 'timeout', 'econnreset', 'other side closed', 'tls', 'eai_again', 'socket', 'connect timeout']
+    .some((needle) => text.includes(needle));
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -547,6 +580,33 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     }
     return await handleUpstreamErrorResponse(response, ctx, key);
   } catch (err) {
+    // [dsh-patch proxy-fallback] opencode-go 直连遇网络类失败时，同一 attempt 内经 HTTP 代理再试一次
+    // （不占重试次数、不换 key）。env: OPENCODE_PROXY=http://host:port，OPENCODE_PROXY_MODE=fallback|always|off
+    const fallbackMode = process.env.OPENCODE_PROXY_MODE ?? 'fallback';
+    if (provider.id === 'opencode-go' && fallbackMode !== 'off' && isNetworkishError(err)) {
+      try {
+        const agent = await getProxyAgent();
+        if (agent) {
+          const timeout = Number(process.env.OPENCODE_PROXY_TIMEOUT_MS ?? 0)
+            || Math.round(ctx.config.requestTimeoutMs * 1.5);
+          const retryInit: RequestInit & { dispatcher?: unknown; duplex?: 'half' } = { ...fetchOptions, dispatcher: agent };
+          const retried = await fetchWithTimeout(upstreamUrl, retryInit, timeout);
+          if (retried.ok) {
+            logger.info({ requestId: ctx.requestId, keyLabel: key.label, model: ctx.modelId, via: 'proxy',
+              timeoutMs: timeout, bodyBytes: ctx.bodyText.length }, 'opencode fallback via proxy succeeded');
+            markKeySucceeded(ctx.state, key.label);
+            completeRequest(ctx.state, ctx.requestId, true);
+            return { kind: 'done', response: await ctx.onSuccess(retried, ctx.state, ctx.requestId, key.label) };
+          }
+          logger.warn({ requestId: ctx.requestId, keyLabel: key.label, status: retried.status, via: 'proxy' },
+            'opencode fallback via proxy got non-ok');
+        }
+      } catch (fallbackErr) {
+        logger.warn({ requestId: ctx.requestId, keyLabel: key.label,
+          err: String((fallbackErr as Error)?.message ?? fallbackErr).slice(0, 140) },
+          'opencode fallback via proxy failed');
+      }
+    }
     return handleNetworkError(err, ctx, key);
   }
 }

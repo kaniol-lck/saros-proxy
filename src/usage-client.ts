@@ -163,10 +163,19 @@ export function maybeRefreshUsage(state: ProxyState, config: ProxyConfig): void 
       const entries = await Promise.all(
         state.keys.map(async (k) => {
           const provider = getProvider(inferProvider({ label: k.label, key: k.key, provider: k.provider as ProviderId | undefined }));
-          // Providers without a queryable usage API (commandcode) are skipped —
-          // weighted rotation simply treats them as having no fresh data.
-          if (!provider || !provider.usagePath()) return [k.label, null] as const;
+          if (!provider) return [k.label, null] as const;
           const base = config.upstreams?.[provider.id] ?? (provider.id === 'opencode-go' ? config.upstreamBaseUrl : provider.baseUrl);
+          // [dsh-patch cc-usage] provider 自带额度探针时优先用它（commandcode 无 usage API）；
+          // 否则走通用的 usagePath() 拉取，两者都没有就当作没有新鲜数据。
+          if (provider.queryUsage) {
+            try {
+              const probe = await provider.queryUsage(k.key, base, USAGE_FETCH_TIMEOUT_MS);
+              return [k.label, probe ? ({ usage: probe } as UsageFetchResult) : null] as const;
+            } catch {
+              return [k.label, null] as const;
+            }
+          }
+          if (!provider.usagePath()) return [k.label, null] as const;
           const usage = await fetchKeyUsage(base, k.key, provider.usagePath());
           return [k.label, usage] as const;
         }),

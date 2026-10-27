@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`queryUsage` provider hook + CommandCode implementation** — the billing
+  endpoints (`/alpha/billing/credits` + `/alpha/billing/subscriptions`) expose
+  `windowLimits` (5h/weekly used+cap) and monthly credits, so quota-weighted
+  rotation can finally see CommandCode's real consumption instead of treating it
+  as "no data".
+- **opencode proxy fallback** (`OPENCODE_PROXY` / `OPENCODE_PROXY_MODE` /
+  `OPENCODE_PROXY_TIMEOUT_MS`) — when a direct request to opencode-go fails at
+  the network level (connect timeout, ECONNRESET, TLS), the same attempt is
+  retried once through an HTTP proxy with its own (default 1.5×) timeout.
+
+### Added
+
 - **`PROVIDER_WEIGHT_FACTOR`** (e.g. `commandcode=0.55,opencode-go=1`) scales the
   quota-based rotation weight per provider, so a provider with a lower observed
   success rate gets a smaller share while staying in rotation for failover.

@@ -165,6 +165,77 @@ export const commandcodeProvider: KeyProvider = {
     return ''; // no queryable per-key usage API without a Studio session cookie
   },
 
+  /**
+   * [dsh-patch cc-usage] CommandCode 没有 per-key usage API，但计费端点能给出：
+   *  - GET /alpha/billing/credits        → windowLimits.fiveHour/weekly {used,cap,resetAt} + credits.monthlyCredits
+   *  - GET /alpha/billing/subscriptions  → planId / currentPeriodEnd（月度周期）
+   * 用它们换算出 usedPercent（取三个窗口里最紧的一个），让加权轮询看得见 cc 的额度。
+   */
+  async queryUsage(apiKey: string, baseUrl: string, timeoutMs: number) {
+    const headers = {
+      ...(commandcodeProvider.extraUpstreamHeaders?.() ?? {}),
+      Authorization: `Bearer ${apiKey}`,
+      Accept: 'application/json',
+    };
+    const getJSON = async (path: string): Promise<Record<string, unknown> | null> => {
+      try {
+        const res = await fetch(new URL(path, baseUrl), { headers, signal: AbortSignal.timeout(timeoutMs) });
+        if (!res.ok) return null;
+        const parsed: unknown = await res.json();
+        return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : null;
+      } catch {
+        return null;
+      }
+    };
+    const [credits, sub] = await Promise.all([
+      getJSON('/alpha/billing/credits'),
+      getJSON('/alpha/billing/subscriptions'),
+    ]);
+    if (!credits) return null;
+
+    const num = (value: unknown): number | null =>
+      typeof value === 'number' && Number.isFinite(value) ? value : null;
+    const obj = (value: unknown): Record<string, unknown> =>
+      typeof value === 'object' && value !== null && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+    const pct = (win: Record<string, unknown>): number | null => {
+      const used = num(win.used);
+      const cap = num(win.cap);
+      if (used === null || cap === null || cap <= 0) return null;
+      return Math.min(100, Math.max(0, Math.round((used / cap) * 1000) / 10));
+    };
+    const iso = (ms: number | null): string | undefined => (ms && ms > 0 ? new Date(ms).toISOString() : undefined);
+
+    const wl = obj(credits.windowLimits);
+    const five = obj(wl.fiveHour);
+    const weekly = obj(wl.weekly);
+    const balance = num(obj(credits.credits).monthlyCredits);
+    const subData = obj(obj(sub).data);
+    const planId = typeof subData.planId === 'string' ? subData.planId : null;
+
+    // 月度 cap：优先套餐文档值，否则用 5h 上限 × 5 估算（GOAT: 14×5=70）
+    const PLAN_MONTHLY_CREDITS: Record<string, number> = {
+      'individual-go': 10, 'individual-goat': 70, 'individual-pro': 80,
+      'individual-max': 100, 'individual-max-20x': 200,
+    };
+    const fiveCap = num(five.cap);
+    const monthCap = planId && PLAN_MONTHLY_CREDITS[planId] != null
+      ? PLAN_MONTHLY_CREDITS[planId]
+      : (fiveCap && fiveCap > 0 ? fiveCap * 5 : null);
+    const monthlyPct = monthCap && monthCap > 0 && balance !== null
+      ? Math.min(100, Math.max(0, Math.round((Math.max(0, monthCap - balance) / monthCap) * 1000) / 10))
+      : null;
+
+    const values = [pct(five), pct(weekly), monthlyPct].filter((v): v is number => v !== null);
+    if (values.length === 0) return null;
+    const periodEnd = typeof subData.currentPeriodEnd === 'string' ? Date.parse(subData.currentPeriodEnd) : null;
+    return {
+      usedPercent: Math.max(...values),
+      rollingResetsAt: iso(num(five.resetAt)),
+      weeklyResetsAt: iso(num(weekly.resetAt)),
+      monthlyResetsAt: iso(periodEnd && Number.isFinite(periodEnd) ? periodEnd : null),
+    };
+  },
+
   parseUsageResponse(_body: string): KeyUsage | null {
     return null;
   },

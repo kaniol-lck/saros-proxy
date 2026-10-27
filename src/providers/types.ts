@@ -67,6 +67,19 @@ export interface KeyProvider {
   usagePath(): string;
 
   /**
+   * [dsh-patch cc-usage] Optional provider-specific quota probe for providers
+   * with no per-key usage API (CommandCode: the billing endpoints expose
+   * windowLimits + monthly credits). When implemented, the usage refresher
+   * prefers it over the generic `usagePath()` fetch.
+   */
+  queryUsage?(apiKey: string, baseUrl: string, timeoutMs: number): Promise<{
+    usedPercent: number;
+    rollingResetsAt?: string;
+    weeklyResetsAt?: string;
+    monthlyResetsAt?: string;
+  } | null>;
+
+  /**
    * Parse a usage response body into the shared KeyUsage shape.
    * Returns null when the body doesn't match this provider's contract.
    */
