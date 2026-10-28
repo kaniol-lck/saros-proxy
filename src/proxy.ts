@@ -580,31 +580,41 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     }
     return await handleUpstreamErrorResponse(response, ctx, key);
   } catch (err) {
-    // [dsh-patch proxy-fallback] opencode-go 直连遇网络类失败时，同一 attempt 内经 HTTP 代理再试一次
-    // （不占重试次数、不换 key）。env: OPENCODE_PROXY=http://host:port，OPENCODE_PROXY_MODE=fallback|always|off
-    const fallbackMode = process.env.OPENCODE_PROXY_MODE ?? 'fallback';
-    if (provider.id === 'opencode-go' && fallbackMode !== 'off' && isNetworkishError(err)) {
+    // [dsh-patch proxy-fallback] 网络类失败时，同一 attempt 内经 HTTP 代理再试一次（不占重试次数、不换 key）。
+    // env:
+    //   OPENCODE_PROXY           代理地址（http(s)，undici 不支持 socks）
+    //   PROXY_FALLBACK_MODE      fallback|off（默认 fallback）
+    //   PROXY_FALLBACK_PROVIDERS 逗号分隔，默认 "opencode-go,commandcode"（两家都在 CF 后面，会同时抖）
+    //   PROXY_FALLBACK_TIMEOUT_MS 单次兜底超时，默认 12000（此前沿用主超时的 45s，失败时占用过久）
+    //   PROXY_FALLBACK_MAX_BYTES  只对不超过该体积的请求兜底，默认 1MB（大 body 走代理更慢、更易超时）
+    const fallbackMode = process.env.PROXY_FALLBACK_MODE ?? process.env.OPENCODE_PROXY_MODE ?? 'fallback';
+    const fallbackProviders = (process.env.PROXY_FALLBACK_PROVIDERS ?? 'opencode-go,commandcode')
+      .split(',').map((s) => s.trim()).filter(Boolean);
+    const fallbackMaxBytes = Number(process.env.PROXY_FALLBACK_MAX_BYTES ?? 1024 * 1024);
+    const fallbackTimeoutMs = Number(process.env.PROXY_FALLBACK_TIMEOUT_MS ?? 0) || 12_000;
+    const withinSizeGate = !fallbackMaxBytes || ctx.bodyText.length <= fallbackMaxBytes;
+    if (fallbackMode !== 'off' && withinSizeGate && fallbackProviders.includes(provider.id) && isNetworkishError(err)) {
       try {
         const agent = await getProxyAgent();
         if (agent) {
-          const timeout = Number(process.env.OPENCODE_PROXY_TIMEOUT_MS ?? 0)
-            || Math.round(ctx.config.requestTimeoutMs * 1.5);
           const retryInit: RequestInit & { dispatcher?: unknown; duplex?: 'half' } = { ...fetchOptions, dispatcher: agent };
-          const retried = await fetchWithTimeout(upstreamUrl, retryInit, timeout);
+          const retried = await fetchWithTimeout(upstreamUrl, retryInit, fallbackTimeoutMs);
           if (retried.ok) {
-            logger.info({ requestId: ctx.requestId, keyLabel: key.label, model: ctx.modelId, via: 'proxy',
-              timeoutMs: timeout, bodyBytes: ctx.bodyText.length }, 'opencode fallback via proxy succeeded');
+            logger.info({ requestId: ctx.requestId, keyLabel: key.label, model: ctx.modelId, provider: provider.id,
+              via: 'proxy', timeoutMs: fallbackTimeoutMs, bodyBytes: ctx.bodyText.length },
+              'fallback via proxy succeeded');
             markKeySucceeded(ctx.state, key.label);
             completeRequest(ctx.state, ctx.requestId, true);
             return { kind: 'done', response: await ctx.onSuccess(retried, ctx.state, ctx.requestId, key.label) };
           }
-          logger.warn({ requestId: ctx.requestId, keyLabel: key.label, status: retried.status, via: 'proxy' },
-            'opencode fallback via proxy got non-ok');
+          logger.warn({ requestId: ctx.requestId, keyLabel: key.label, provider: provider.id,
+            status: retried.status, via: 'proxy' }, 'fallback via proxy got non-ok');
         }
       } catch (fallbackErr) {
-        logger.warn({ requestId: ctx.requestId, keyLabel: key.label,
+        logger.warn({ requestId: ctx.requestId, keyLabel: key.label, provider: provider.id,
+          timeoutMs: fallbackTimeoutMs, bodyBytes: ctx.bodyText.length,
           err: String((fallbackErr as Error)?.message ?? fallbackErr).slice(0, 140) },
-          'opencode fallback via proxy failed');
+          'fallback via proxy failed');
       }
     }
     return handleNetworkError(err, ctx, key);

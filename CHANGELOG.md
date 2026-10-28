@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Proxy fallback generalized** (`[dsh-patch proxy-fallback]`): it now covers
+  `PROXY_FALLBACK_PROVIDERS` (default `opencode-go,commandcode` — both live
+  behind Cloudflare and fail together), uses its own short timeout
+  (`PROXY_FALLBACK_TIMEOUT_MS`, default 12s instead of 1.5× request timeout)
+  and only retries bodies up to `PROXY_FALLBACK_MAX_BYTES` (default 1MB).
+
 ### Added
 
 - **`queryUsage` provider hook + CommandCode implementation** — the billing
