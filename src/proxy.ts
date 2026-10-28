@@ -591,7 +591,15 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     const fallbackProviders = (process.env.PROXY_FALLBACK_PROVIDERS ?? 'opencode-go,commandcode')
       .split(',').map((s) => s.trim()).filter(Boolean);
     const fallbackMaxBytes = Number(process.env.PROXY_FALLBACK_MAX_BYTES ?? 1024 * 1024);
-    const fallbackTimeoutMs = Number(process.env.PROXY_FALLBACK_TIMEOUT_MS ?? 0) || 12_000;
+    // 超时按体积自适应：代理吞吐约 27–70KB/s，固定 12s 会让大 body 输在半路
+    // （实测 57 次 12s 超时里绝大多数是 300KB+ 的请求）。timeout = base + bytes/rate，封顶 max。
+    const fallbackTimeoutBase = Number(process.env.PROXY_FALLBACK_TIMEOUT_MS ?? 0) || 12_000;
+    const fallbackBytesPerSec = Number(process.env.PROXY_FALLBACK_BYTES_PER_SEC ?? 0) || 40_000;
+    const fallbackTimeoutMax = Number(process.env.PROXY_FALLBACK_TIMEOUT_MAX_MS ?? 0) || 45_000;
+    const fallbackTimeoutMs = Math.min(
+      fallbackTimeoutMax,
+      Math.round(fallbackTimeoutBase + ctx.bodyText.length / fallbackBytesPerSec),
+    );
     const withinSizeGate = !fallbackMaxBytes || ctx.bodyText.length <= fallbackMaxBytes;
     if (fallbackMode !== 'off' && withinSizeGate && fallbackProviders.includes(provider.id) && isNetworkishError(err)) {
       try {

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Proxy fallback timeout scales with body size** (`PROXY_FALLBACK_BYTES_PER_SEC`, default 40KB/s, ceiling `PROXY_FALLBACK_TIMEOUT_MAX_MS`, default 45s): a fixed 12s made most 300KB+ bodies time out mid-upload through the proxy.
+
+
+### Changed
+
 - **Proxy fallback generalized** (`[dsh-patch proxy-fallback]`): it now covers
   `PROXY_FALLBACK_PROVIDERS` (default `opencode-go,commandcode` — both live
   behind Cloudflare and fail together), uses its own short timeout
