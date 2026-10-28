@@ -598,7 +598,7 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     const fallbackTimeoutMax = Number(process.env.PROXY_FALLBACK_TIMEOUT_MAX_MS ?? 0) || 45_000;
     const fallbackTimeoutMs = Math.min(
       fallbackTimeoutMax,
-      Math.round(fallbackTimeoutBase + ctx.bodyText.length / fallbackBytesPerSec),
+      Math.round(fallbackTimeoutBase + (ctx.bodyText.length / fallbackBytesPerSec) * 1000),
     );
     const withinSizeGate = !fallbackMaxBytes || ctx.bodyText.length <= fallbackMaxBytes;
     if (fallbackMode !== 'off' && withinSizeGate && fallbackProviders.includes(provider.id) && isNetworkishError(err)) {
