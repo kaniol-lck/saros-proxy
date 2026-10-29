@@ -285,6 +285,18 @@ async function getProxyAgent(): Promise<unknown> {
   return proxyAgentCache;
 }
 
+/**
+ * [dsh-patch same-key-retry] 值得"同 key 立即重试"的网络错误。
+ * 排除 Connect Timeout：那说明到上游的路径整体不通，重试只会再等一个超时。
+ */
+function isRetryableSameKey(err: unknown): boolean {
+  if (!isNetworkishError(err)) return false;
+  const message = String((err as Error)?.message ?? err ?? '');
+  const cause = String(((err as { cause?: { code?: string; message?: string } })?.cause?.code
+    ?? (err as { cause?: { message?: string } })?.cause?.message) ?? '');
+  return !(message + ' ' + cause).toLowerCase().includes('connect timeout');
+}
+
 /** Network-level failures worth retrying through the proxy. */
 function isNetworkishError(err: unknown): boolean {
   const message = String((err as Error)?.message ?? err ?? '');
@@ -474,6 +486,8 @@ interface RetryContext {
   /** Model id parsed from the request body (for affinity routing); optional. */
   modelId?: string;
   onSuccess: SuccessHandler;
+  /** [dsh-patch same-key-retry] 每个请求允许 1 次"同 key 网络重试"。 */
+  sameKeyRetryBudget?: number;
 }
 
 type AttemptResult =
@@ -509,6 +523,7 @@ async function executeWithRetry(opts: {
     kind: opts.kind,
     modelId: opts.modelId,
     onSuccess: opts.onSuccess,
+    sameKeyRetryBudget: 1,
   };
 
   let lastError: Error | null = null;
@@ -580,6 +595,29 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     }
     return await handleUpstreamErrorResponse(response, ctx, key);
   } catch (err) {
+    // [dsh-patch same-key-retry] 网络类失败（且不是 Connect Timeout —— 那说明路径断了）时，
+    // 先用 10s 短超时对同一把 key 再试一次：瞬时 ECONNRESET / other side closed 常能一次救回，
+    // 且失败发生在收到首字节前，不会重复计费。仍失败再走代理兜底 → failover。
+    if (isRetryableSameKey(err) && (ctx.sameKeyRetryBudget ?? 0) > 0) {
+      ctx.sameKeyRetryBudget = (ctx.sameKeyRetryBudget ?? 1) - 1;
+      const retryTimeout = Number(process.env.SAME_KEY_RETRY_TIMEOUT_MS ?? 0) || 10_000;
+      try {
+        const retried = await fetchWithTimeout(upstreamUrl, fetchOptions, retryTimeout);
+        if (retried.ok) {
+          logger.info({ requestId: ctx.requestId, keyLabel: key.label, provider: provider.id,
+            timeoutMs: retryTimeout, bodyBytes: ctx.bodyText.length }, 'same-key retry succeeded');
+          markKeySucceeded(ctx.state, key.label);
+          completeRequest(ctx.state, ctx.requestId, true);
+          return { kind: 'done', response: await ctx.onSuccess(retried, ctx.state, ctx.requestId, key.label) };
+        }
+        logger.warn({ requestId: ctx.requestId, keyLabel: key.label, status: retried.status },
+          'same-key retry got non-ok');
+      } catch (retryErr) {
+        logger.warn({ requestId: ctx.requestId, keyLabel: key.label,
+          err: String((retryErr as Error)?.message ?? retryErr).slice(0, 120) }, 'same-key retry failed');
+      }
+    }
+
     // [dsh-patch proxy-fallback] 网络类失败时，同一 attempt 内经 HTTP 代理再试一次（不占重试次数、不换 key）。
     // env:
     //   OPENCODE_PROXY           代理地址（http(s)，undici 不支持 socks）

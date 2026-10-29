@@ -1,4 +1,4 @@
-﻿# Changelog
+# Changelog
 
 All notable changes to this project will be documented in this file.
 
@@ -6,6 +6,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Added
+
+- **Same-key network retry** (`[dsh-patch same-key-retry]`): after a network-level failure that is not a connect timeout (`ECONNRESET`, `other side closed`, socket errors), the same key is retried once with a short `SAME_KEY_RETRY_TIMEOUT_MS` (default 10s) before the proxy fallback and failover. Transient resets often succeed on the second try and no bytes were produced yet, so nothing is billed twice.
+
 
 ### Changed
 
