@@ -600,7 +600,17 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     // 且失败发生在收到首字节前，不会重复计费。仍失败再走代理兜底 → failover。
     if (isRetryableSameKey(err) && (ctx.sameKeyRetryBudget ?? 0) > 0) {
       ctx.sameKeyRetryBudget = (ctx.sameKeyRetryBudget ?? 1) - 1;
-      const retryTimeout = Number(process.env.SAME_KEY_RETRY_TIMEOUT_MS ?? 0) || 10_000;
+      // 超时按体积自适应（与代理兜底同一套公式）：固定 10s 会输在 1MB+ 的 body 上
+      // （实测 78 次同 key 重试超时，救回的请求 p50 就有 1054KB）。
+      const retryBase = Number(process.env.SAME_KEY_RETRY_TIMEOUT_MS ?? 0) || 10_000;
+      const retryBytesPerSec = Number(process.env.SAME_KEY_RETRY_BYTES_PER_SEC
+        ?? process.env.PROXY_FALLBACK_BYTES_PER_SEC ?? 0) || 40_000;
+      const retryTimeoutMax = Number(process.env.SAME_KEY_RETRY_TIMEOUT_MAX_MS
+        ?? process.env.PROXY_FALLBACK_TIMEOUT_MAX_MS ?? 0) || 45_000;
+      const retryTimeout = Math.min(
+        retryTimeoutMax,
+        Math.round(retryBase + (ctx.bodyText.length / retryBytesPerSec) * 1000),
+      );
       try {
         const retried = await fetchWithTimeout(upstreamUrl, fetchOptions, retryTimeout);
         if (retried.ok) {

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Same-key retry timeout scales with body size** (`SAME_KEY_RETRY_BYTES_PER_SEC`, default 40KB/s, ceiling `SAME_KEY_RETRY_TIMEOUT_MAX_MS`, default 45s): a fixed 10s cut off the 1MB+ bodies that this retry rescues most often.
+
+
 ### Added
 
 - **Same-key network retry** (`[dsh-patch same-key-retry]`): after a network-level failure that is not a connect timeout (`ECONNRESET`, `other side closed`, socket errors), the same key is retried once with a short `SAME_KEY_RETRY_TIMEOUT_MS` (default 10s) before the proxy fallback and failover. Transient resets often succeed on the second try and no bytes were produced yet, so nothing is billed twice.
