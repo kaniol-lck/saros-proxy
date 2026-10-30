@@ -624,6 +624,7 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
           'same-key retry got non-ok');
       } catch (retryErr) {
         logger.warn({ requestId: ctx.requestId, keyLabel: key.label,
+          timeoutMs: retryTimeout, bodyBytes: ctx.bodyText.length,
           err: String((retryErr as Error)?.message ?? retryErr).slice(0, 120) }, 'same-key retry failed');
       }
     }
