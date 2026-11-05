@@ -573,7 +573,7 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
   // [dsh-patch req-metrics] 面板需要"每次请求"的 model / 耗时 / 请求体大小
   const attemptStartedAt = Date.now();
   try {
-    const response = await fetchWithTimeout(upstreamUrl, fetchOptions, ctx.config.requestTimeoutMs);
+    const response = await fetchWithTimeout(upstreamUrl, fetchOptions, attemptTimeoutMs(ctx));
     if (response.ok) {
       markKeySucceeded(ctx.state, key.label);
       completeRequest(ctx.state, ctx.requestId, true);
@@ -783,7 +783,7 @@ function handleNetworkError(err: unknown, ctx: RetryContext, key: KeySnapshot): 
   // faults: penalising them disabled every key during upstream hangs and
   // locked the proxy into "all keys unavailable" until cooldown expired.
   if (lastError instanceof TimeoutError) {
-    logTimeout(ctx.requestId, key, ctx.config.requestTimeoutMs, ctx.kind);
+    logTimeout(ctx.requestId, key, attemptTimeoutMs(ctx), ctx.kind);
   } else {
     logNetworkError(ctx.requestId, key, err, ctx.kind);
   }
@@ -888,6 +888,21 @@ function logUpstreamError(
       'Upstream streaming error',
     );
   }
+}
+
+/**
+ * [dsh-patch stream-timeout] 流式请求的上游超时按 body 体积放大。
+ * 大 prompt（>512KB）在 cc/oc 上"出首 token"本身就可能超过 30s，固定 30s 会把
+ * 正常的慢请求误判成超时、触发无谓的 failover（实测 cc 30s 超时是单类错误里最多的）。
+ * timeout = requestTimeoutMs + bodyBytes/STREAM_TIMEOUT_BYTES_PER_SEC*1000，封顶 STREAM_TIMEOUT_MAX_MS。
+ * 标准请求不受影响（保持 requestTimeoutMs）。
+ */
+function attemptTimeoutMs(ctx: RetryContext): number {
+  const base = ctx.config.requestTimeoutMs;
+  if (ctx.kind !== 'streaming') return base;
+  const bytesPerSec = Number(process.env.STREAM_TIMEOUT_BYTES_PER_SEC ?? 0) || 40_000;
+  const cap = Number(process.env.STREAM_TIMEOUT_MAX_MS ?? 0) || 120_000;
+  return Math.min(cap, Math.round(base + (ctx.bodyText.length / bytesPerSec) * 1000));
 }
 
 function logTimeout(requestId: string, key: KeySnapshot, timeoutMs: number, kind: RequestKind): void {

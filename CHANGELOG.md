@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Streaming upstream timeout scales with body size** (`STREAM_TIMEOUT_BYTES_PER_SEC`, default 40KB/s, ceiling `STREAM_TIMEOUT_MAX_MS`, default 120s): the fixed 30s cut off large prompts that legitimately need longer to produce the first token, which showed up as the single most frequent error (Streaming request timed out after 30000ms). Standard requests keep `requestTimeoutMs`.
+
+
+### Changed
+
 - **Same-key retry timeout scales with body size** (`SAME_KEY_RETRY_BYTES_PER_SEC`, default 40KB/s, ceiling `SAME_KEY_RETRY_TIMEOUT_MAX_MS`, default 45s): a fixed 10s cut off the 1MB+ bodies that this retry rescues most often.
 
 
