@@ -384,7 +384,11 @@ export function buildUpstreamHeaders(
       lower === 'transfer-encoding' ||
       lower === 'upgrade' ||
       lower === 'authorization' ||
-      lower === 'content-length'
+      lower === 'content-length' ||
+      // [dsh-patch expect-header] undici 会抛 "expect header not supported"：
+      // curl 对大 body 会自动加 Expect: 100-continue，.NET HttpClient 默认也发，
+      // 转发它会直接 502（实测 1.3MB 请求全部瞬时失败）。
+      lower === 'expect'
     ) {
       continue;
     }
