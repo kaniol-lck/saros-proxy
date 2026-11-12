@@ -829,7 +829,15 @@ function buildClientErrorResponse(status: number, errorBody: string, requestId: 
 function handleAllRetriesFailed(ctx: RetryContext, maxRetries: number, lastError: Error | null): Response {
   completeRequest(ctx.state, ctx.requestId, false);
   logger.error(
-    { requestId: ctx.requestId, err: lastError, kind: ctx.kind },
+    {
+      requestId: ctx.requestId,
+      err: lastError,
+      kind: ctx.kind,
+      // [dsh-patch 502-diagnostics] 记录请求体大小与模型，便于统计"502 是否集中在大 body"。
+      // 失败轮询器（dashboard/failure_watch.py）会直接读这两个字段做相关性分析。
+      bodyBytes: ctx.bodyText.length,
+      model: ctx.modelId,
+    },
     ctx.kind === 'standard'
       ? 'All %d retries exhausted, returning 502'
       : 'Streaming failed after %d attempts',
