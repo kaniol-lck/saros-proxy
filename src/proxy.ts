@@ -24,6 +24,7 @@ import {
   classifyHttpError,
   type ProxyState,
   type KeySnapshot,
+  peekAlternativeKeys,
 } from './proxy-logic.js';
 import type { ProxyConfig } from './config.js';
 import { logger, maskKey } from './logger.js';
@@ -319,14 +320,19 @@ async function fetchWithTimeout(
   url: string,
   options: RequestInit,
   timeoutMs: number,
+  externalSignal?: AbortSignal,
 ): Promise<Response> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+  // [dsh-patch hedge] 支持外部取消（对冲落败的那条连接要能立刻 abort）
+  const signal = externalSignal
+    ? AbortSignal.any([controller.signal, externalSignal])
+    : controller.signal;
 
   try {
     const response = await fetch(url, {
       ...options,
-      signal: controller.signal,
+      signal,
     });
     clearTimeout(timeoutId);
     return response;
@@ -541,23 +547,16 @@ async function executeWithRetry(opts: {
   return handleAllRetriesFailed(ctx, opts.maxRetries, lastError);
 }
 
-async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise<AttemptResult> {
-  const key = pickKey(ctx, attempt);
-  if (!key) {
-    return { kind: 'done', response: buildNoKeysResponse(ctx.state, ctx.requestId, ctx.kind, attempt) };
-  }
-
-  logKeyAttempt(ctx.requestId, key, attempt, ctx.kind);
-  // Per-attempt upstream: keys may be mixed-provider within one failover chain.
-  // Suffix-routed models (@provider) pin the provider and lose the suffix
-  // in the forwarded body; the upstream never sees saros's routing shim.
+/** 按 key 构造一次上游请求（provider / URL / 请求体 / 头部全由 key 决定）。 */
+function buildAttemptRequest(
+  ctx: RetryContext,
+  key: KeySnapshot,
+): { provider: KeyProvider; upstreamUrl: string; fetchOptions: RequestInit & { duplex?: 'half' } } {
   const provider = providerForKey(key, ctx.config, ctx.modelId);
   const upstreamUrl = resolveUpstreamUrl(ctx.config, provider, ctx.path);
   const sessionHeader = provider.sessionHeader;
   const prepared = ctx.bodyText
     ? prepareOutboundRequest(ctx.bodyText, ctx.modelId, provider, {
-        // `stream_options` is a Chat Completions field — never inject it into
-        // other streaming surfaces (e.g. the Responses API).
         wantsStreamUsage: ctx.kind === 'streaming' && ctx.path.endsWith('/chat/completions'),
         clientSessionId: sessionHeader
           ? ctx.incomingHeaders.get(sessionHeader) ?? undefined
@@ -572,12 +571,85 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     bearerToken: key.key,
     provider,
     sessionId: prepared.sessionId,
+  }) as RequestInit & { duplex?: 'half' };
+  return { provider, upstreamUrl, fetchOptions };
+}
+
+/**
+ * [dsh-patch hedge] 流式请求的对冲：HEDGE_AFTER_MS 内没拿到响应头，就在另一把 key 上并发发一次，
+ * 谁先出响应头用谁，另一条 abort。目的：oc 重置波段里不用干等 oc 超时，直接抢 cc 的先手。
+ * HEDGE_AFTER_MS=0（默认）时退化为普通单请求，行为与之前完全一致。
+ */
+async function fetchWithHedge(
+  ctx: RetryContext,
+  key: KeySnapshot,
+  timeoutMs: number,
+  hedgeAfterMs: number,
+): Promise<Response> {
+  const primaryReq = buildAttemptRequest(ctx, key);
+  if (hedgeAfterMs <= 0 || ctx.kind !== 'streaming') {
+    return fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs);
+  }
+
+  const hedgeKey = peekAlternativeKeys(ctx.state, ctx.requestId, key.label)
+    .find((cand) => providerCanServe(providerForKey(cand, ctx.config, ctx.modelId), ctx.modelId));
+  if (!hedgeKey) {
+    return fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs);
+  }
+
+  const primaryCtrl = new AbortController();
+  const hedgeCtrl = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | null = null;
+
+  const primary = fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs, primaryCtrl.signal);
+  const hedge = new Promise<{ res: Response; label: string; via: string }>((resolve, reject) => {
+    timer = setTimeout(() => {
+      const hreq = buildAttemptRequest(ctx, hedgeKey);
+      fetchWithTimeout(hreq.upstreamUrl, hreq.fetchOptions, timeoutMs, hedgeCtrl.signal)
+        .then((res) => resolve({ res, label: hedgeKey.label, via: 'hedge' }), reject);
+    }, hedgeAfterMs);
   });
+
+  try {
+    const winner = await Promise.race([
+      primary.then((res) => ({ res, label: key.label, via: 'primary' })),
+      hedge,
+    ]);
+    if (timer) clearTimeout(timer);
+    if (winner.via === 'hedge') {
+      primaryCtrl.abort();
+      logger.warn(
+        { requestId: ctx.requestId, from: key.label, to: winner.label, hedgeAfterMs, ok: winner.res.ok },
+        'hedged request won',
+      );
+    } else {
+      hedgeCtrl.abort();
+    }
+    return winner.res;
+  } catch (err) {
+    if (timer) clearTimeout(timer);
+    hedgeCtrl.abort();
+    primaryCtrl.abort();
+    throw err;
+  }
+}
+
+async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise<AttemptResult> {
+  const key = pickKey(ctx, attempt);
+  if (!key) {
+    return { kind: 'done', response: buildNoKeysResponse(ctx.state, ctx.requestId, ctx.kind, attempt) };
+  }
+
+  logKeyAttempt(ctx.requestId, key, attempt, ctx.kind);
+  // Per-attempt upstream: keys may be mixed-provider within one failover chain.
+  // （构造逻辑抽到 buildAttemptRequest，对冲时要用同一套逻辑再构造一次）
+  const { provider, upstreamUrl, fetchOptions } = buildAttemptRequest(ctx, key);
 
   // [dsh-patch req-metrics] 面板需要"每次请求"的 model / 耗时 / 请求体大小
   const attemptStartedAt = Date.now();
   try {
-    const response = await fetchWithTimeout(upstreamUrl, fetchOptions, attemptTimeoutMs(ctx));
+    const hedgeAfterMs = Number(process.env.HEDGE_AFTER_MS ?? 0) || 0;
+    const response = await fetchWithHedge(ctx, key, attemptTimeoutMs(ctx), hedgeAfterMs);
     if (response.ok) {
       markKeySucceeded(ctx.state, key.label);
       completeRequest(ctx.state, ctx.requestId, true);

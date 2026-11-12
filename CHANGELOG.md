@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Hedged streaming requests** (`[dsh-patch hedge]`, `HEDGE_AFTER_MS`, default off): when a streaming request has not received response headers within `HEDGE_AFTER_MS`, the same request is started in parallel on another eligible key; whichever produces headers first wins and the loser is aborted. This avoids waiting out the whole upstream timeout when one provider is resetting connections.
+
+
 ### Changed
 
 - **Streaming upstream timeout scales with body size** (`STREAM_TIMEOUT_BYTES_PER_SEC`, default 40KB/s, ceiling `STREAM_TIMEOUT_MAX_MS`, default 120s): the fixed 30s cut off large prompts that legitimately need longer to produce the first token, which showed up as the single most frequent error (Streaming request timed out after 30000ms). Standard requests keep `requestTimeoutMs`.

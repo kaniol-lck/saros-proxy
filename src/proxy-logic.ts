@@ -194,6 +194,30 @@ function buildBookedLabels(state: ProxyState): Set<string> {
  *  - Without usage data (or when every candidate is exhausted), falls back to
  *    plain round-robin ordering.
  */
+/**
+ * [dsh-patch hedge] 列出可用于"对冲"的备选 key（不改变加权状态、不消耗 triedKeys）：
+ * 只返回未被本请求试过、当前可用、且通过 provider 过滤的 key。
+ * 调用方（proxy.ts）还会再用 providerCanServe 过滤一次。
+ */
+export function peekAlternativeKeys(
+  state: ProxyState,
+  requestId: string,
+  excludeLabel: string,
+): KeySnapshot[] {
+  const ctx = state.activeRequests.get(requestId);
+  const tried = new Set<string>(ctx?.triedKeys ?? []);
+  tried.add(excludeLabel);
+  const filter = ctx?.providerFilter;
+  const out: KeySnapshot[] = [];
+  for (const key of state.keys) {
+    if (tried.has(key.label)) continue;
+    if (!isKeyAvailable(state, key)) continue;
+    if (filter && !filter(key.provider)) continue;
+    out.push(toSnapshot(key));
+  }
+  return out;
+}
+
 function findNextKey(
   state: ProxyState,
   excludeLabels: Set<string>,
