@@ -612,11 +612,16 @@ async function executeWithRetry(opts: {
 }
 
 /** 按 key 构造一次上游请求（provider / URL / 请求体 / 头部全由 key 决定）。 */
-function buildAttemptRequest(
+async function buildAttemptRequest(
   ctx: RetryContext,
   key: KeySnapshot,
-): { provider: KeyProvider; upstreamUrl: string; fetchOptions: RequestInit & { duplex?: 'half' } } {
+): Promise<{ provider: KeyProvider; upstreamUrl: string; fetchOptions: RequestInit & { duplex?: 'half' } }> {
   const provider = providerForKey(key, ctx.config, ctx.modelId);
+  // [dsh-patch wb2api-bridge] workbuddy 的 catalog 必须先预热：resolveNativeId
+  // 依赖它做 global: 前缀改写，冷启动空缓存会导致 wb2api 收到裸名 503。
+  if (provider.id === 'workbuddy') {
+    await provider.fetchCatalog?.(8000).catch(() => undefined);
+  }
   const upstreamUrl = resolveUpstreamUrl(ctx.config, provider, ctx.path);
   const sessionHeader = provider.sessionHeader;
   const prepared = ctx.bodyText
@@ -669,7 +674,7 @@ async function fetchWithHedge(
   const primary = fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs, primaryCtrl.signal);
   const hedge = new Promise<{ res: Response; label: string; via: string }>((resolve, reject) => {
     timer = setTimeout(() => {
-      const hreq = buildAttemptRequest(ctx, hedgeKey);
+      const hreq = await buildAttemptRequest(ctx, hedgeKey);
       fetchWithTimeout(hreq.upstreamUrl, hreq.fetchOptions, timeoutMs, hedgeCtrl.signal)
         .then((res) => resolve({ res, label: hedgeKey.label, via: 'hedge' }), reject);
     }, hedgeAfterMs);
@@ -708,7 +713,7 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
   logKeyAttempt(ctx.requestId, key, attempt, ctx.kind);
   // Per-attempt upstream: keys may be mixed-provider within one failover chain.
   // （构造逻辑抽到 buildAttemptRequest，对冲时要用同一套逻辑再构造一次）
-  const { provider, upstreamUrl, fetchOptions } = buildAttemptRequest(ctx, key);
+  const { provider, upstreamUrl, fetchOptions } = await buildAttemptRequest(ctx, key);
 
   // [dsh-patch req-metrics] 面板需要"每次请求"的 model / 耗时 / 请求体大小
   const attemptStartedAt = Date.now();
