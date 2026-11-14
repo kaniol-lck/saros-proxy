@@ -54,7 +54,8 @@ export const workbuddyProvider: KeyProvider = {
   id: 'workbuddy',
   displayName: 'WorkBuddy (gateway)',
   baseUrl: BASE_URL,
-  chatBasePath: '/zen/go/v1', // clients always speak opencode-go shapes; remapped below
+  // wb2api serves the OpenAI standard: /v1/chat/completions (+ /v1/models)
+  chatBasePath: '/v1',
 
   quickMatch(key: string) {
     return key.startsWith('wbk_') ? 'yes' : 'no';
