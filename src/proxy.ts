@@ -655,7 +655,7 @@ async function fetchWithHedge(
   timeoutMs: number,
   hedgeAfterMs: number,
 ): Promise<Response> {
-  const primaryReq = buildAttemptRequest(ctx, key);
+  const primaryReq = await buildAttemptRequest(ctx, key);
   if (hedgeAfterMs <= 0 || ctx.kind !== 'streaming') {
     return fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs);
   }
@@ -674,9 +674,13 @@ async function fetchWithHedge(
   const primary = fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs, primaryCtrl.signal);
   const hedge = new Promise<{ res: Response; label: string; via: string }>((resolve, reject) => {
     timer = setTimeout(() => {
-      const hreq = await buildAttemptRequest(ctx, hedgeKey);
-      fetchWithTimeout(hreq.upstreamUrl, hreq.fetchOptions, timeoutMs, hedgeCtrl.signal)
-        .then((res) => resolve({ res, label: hedgeKey.label, via: 'hedge' }), reject);
+      void (async () => {
+        try {
+          const hreq = await buildAttemptRequest(ctx, hedgeKey);
+          const res = await fetchWithTimeout(hreq.upstreamUrl, hreq.fetchOptions, timeoutMs, hedgeCtrl.signal);
+          resolve({ res, label: hedgeKey.label, via: 'hedge' });
+        } catch (err) { reject(err); }
+      })();
     }, hedgeAfterMs);
   });
 
