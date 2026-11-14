@@ -638,9 +638,9 @@ async function buildAttemptRequest(
     }
     const ids = wbModelCache.get("ids")?.ids ?? [];
     const g = "global:" + ctx.modelId;
-    const c = "cn:" + ctx.modelId;
+    // [wb2api-bridge] 只走 global：cn 区账号（五羊飞）不支持 deepseek 系模型，
+    // catalog 里虽有同名条目，但先试 cn 会 503 浪费一次上游往返。
     if (ids.includes(g)) ctx.workbuddyRewrite = g;
-    else if (ids.includes(c)) ctx.workbuddyRewrite = c;
     else {
       const hit = ids.find((id) => id.startsWith("global:") && id.slice(7).startsWith(ctx.modelId ?? ""));
       if (hit) ctx.workbuddyRewrite = hit;
