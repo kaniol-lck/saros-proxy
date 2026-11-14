@@ -45,6 +45,9 @@ import type { KeyProvider, ProviderId } from './providers/index.js';
 /** Canonical client-facing chat route prefix (the opencode-go shape). */
 const CANONICAL_CHAT_BASE = '/zen/go/v1';
 
+// [dsh-patch wb2api-bridge] workbuddy 的模型目录缓存（/v1/models 需要鉴权）
+const wbModelCache = new Map<string, { at: number; ids: string[] }>();
+
 /**
  * Resolve the upstream URL for one attempt: per-provider base URL + path
  * remapping. Clients always speak canonical saros routes (/zen/go/v1/<rest>,
@@ -562,6 +565,8 @@ interface RetryContext {
   onSuccess: SuccessHandler;
   /** [dsh-patch same-key-retry] 每个请求允许 1 次"同 key 网络重试"。 */
   sameKeyRetryBudget?: number;
+  /** [dsh-patch wb2api-bridge] workbuddy 的模型前缀改写目标（global:xxx）。 */
+  workbuddyRewrite?: string;
 }
 
 type AttemptResult =
@@ -617,10 +622,29 @@ async function buildAttemptRequest(
   key: KeySnapshot,
 ): Promise<{ provider: KeyProvider; upstreamUrl: string; fetchOptions: RequestInit & { duplex?: 'half' } }> {
   const provider = providerForKey(key, ctx.config, ctx.modelId);
-  // [dsh-patch wb2api-bridge] workbuddy 的 catalog 必须先预热：resolveNativeId
-  // 依赖它做 global: 前缀改写，冷启动空缓存会导致 wb2api 收到裸名 503。
-  if (provider.id === 'workbuddy') {
-    await provider.fetchCatalog?.(8000).catch(() => undefined);
+  // [dsh-patch wb2api-bridge] workbuddy 的 /v1/models 需要鉴权，provider 级
+  // fetchCatalog 拉不到；这里带 key 拉一次并缓存（5 分钟），供 model 前缀改写。
+  if (provider.id === 'workbuddy' && ctx.modelId && !ctx.modelId.includes(':')) {
+    const cached = wbModelCache.get("ids");
+    if (!cached || Date.now() - cached.at > 300_000) {
+      try {
+        const r = await fetchWithTimeout(provider.baseUrl + "/v1/models",
+          { headers: { authorization: "Bearer " + key.key, accept: "application/json" } }, 8000);
+        if (r.ok) {
+          const j = (await r.json()) as { data?: Array<{ id: string }> };
+          wbModelCache.set("ids", { at: Date.now(), ids: (j.data ?? []).map((m: { id: string }) => String(m.id)) });
+        }
+      } catch { /* 缓存失败则保持裸名，wb2api 自己也会拒 */ }
+    }
+    const ids = wbModelCache.get("ids")?.ids ?? [];
+    const g = "global:" + ctx.modelId;
+    const c = "cn:" + ctx.modelId;
+    if (ids.includes(g)) ctx.workbuddyRewrite = g;
+    else if (ids.includes(c)) ctx.workbuddyRewrite = c;
+    else {
+      const hit = ids.find((id) => id.startsWith("global:") && id.slice(7).startsWith(ctx.modelId ?? ""));
+      if (hit) ctx.workbuddyRewrite = hit;
+    }
   }
   const upstreamUrl = resolveUpstreamUrl(ctx.config, provider, ctx.path);
   const sessionHeader = provider.sessionHeader;
