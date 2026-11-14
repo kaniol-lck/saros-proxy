@@ -252,6 +252,10 @@ function providerForKey(key: KeySnapshot, config: ProxyConfig, modelId?: string)
     const pinned = getProvider(suffixProvider as ProviderId);
     if (pinned) return pinned;
   }
+  // [dsh-patch wb2api-bridge] key 快照携带 config 声明的 provider —— 裸 api_key
+  // （workbuddy 网关）无法从 key 本身推断，必须信任 config 的显式声明。
+  const declared = getProvider(key.provider as ProviderId);
+  if (declared) return declared;
   const inferred = inferProvider({ label: key.label, key: key.key });
   void config;
   return getProvider(inferred) ?? getProvider('opencode-go')!;
