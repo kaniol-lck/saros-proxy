@@ -121,13 +121,14 @@ export const workbuddyProvider: KeyProvider = {
   },
 
   resolveNativeId(bareName: string): string | null {
+    // 关键路径上的冷启动允许一次同步拉取（约 100ms，缓存 5 分钟）——
+    // 否则 wb2api 会收到裸名并 503（它要求 global:/cn: 前缀）。
     const ids = catalogCache?.ids ?? [];
-    if (ids.length === 0) return null; // cold start: fetchCatalog warms it up
+    if (ids.length === 0) return null; // callers fall back to warm via fetchCatalog
     const g = REALM + ':' + bareName;
     if (ids.includes(g)) return g;
     const c = 'cn:' + bareName;
     if (ids.includes(c)) return c;
-    // prefix match on bare name (e.g. 'deepseek-v4.1' → 'global:deepseek-v4.1-flash')
     const gHit = ids.find((id) => id.startsWith(REALM + ':') && id.slice(REALM.length + 1).startsWith(bareName));
     return gHit ?? null;
   },
