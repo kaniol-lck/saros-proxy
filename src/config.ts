@@ -133,8 +133,18 @@ export function validateConfig(config: Partial<ProxyConfig>): ProxyConfig {
   }
 
   // --- API keys (structurally valid for some provider, >= 20 chars) ---
+  // [dsh-patch wb2api-bridge] provider: workbuddy 的 key 是网关自发的裸 api_key
+  // （无结构前缀），isPlausibleKey 会拒绝 —— 显式声明 provider 时按
+  // "provider 存在 + key >= 20 字符" 放行，交由该 provider 的 smokeTest 真实验证。
   const rawKeys = config.keys ?? [];
   const validKeys = rawKeys.filter((k) => {
+    if (k.provider === 'workbuddy') {
+      if (typeof k.key !== 'string' || k.key.length < 20) {
+        logger.warn('Invalid workbuddy key "%s" (too short), filtering out', maskKey(k.key));
+        return false;
+      }
+      return true;
+    }
     if (!isValidApiKey(k.key)) {
       logger.warn('Invalid key "%s", filtering out', maskKey(k.key));
       return false;
