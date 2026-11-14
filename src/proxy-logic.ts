@@ -595,6 +595,10 @@ export function classifyHttpError(status: number, _body?: string): ErrorType {
     if (_body && /UsageLimitError|usage limit reached|resets in/i.test(_body)) return 'QuotaExhausted';
     return 'ServerFault';
   }
+  // [dsh-patch wb2api-bridge] wb2api 的 per-model cooldown 400 语义是"这台网关
+  // 暂时服务不了该模型"——换 provider（cc/oc）可能成功，必须 failover，
+  // 不能像普通 400 那样透传给客户端。
+  if (status === 400 && _body && /per-model cooldown/i.test(_body)) return 'ServerFault';
   if (status === 400 || status === 403 || status === 404 || status === 422) return 'RequestFault';
   if (status === 500 || status === 502 || status === 503) {
     // Server errors: if the body hints at a quota/balance issue treat as KeyFault
