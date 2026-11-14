@@ -23,8 +23,9 @@ export interface KeyEntry {
  * config.yaml).
  */
 export function inferProvider(entry: KeyEntry): ProviderId {
-  if (entry.provider === 'commandcode' || entry.provider === 'opencode-go') {
+  if (entry.provider === 'commandcode' || entry.provider === 'opencode-go' || entry.provider === 'workbuddy') {
     return entry.provider;
   }
+  if (entry.key.startsWith('wbk_')) return 'workbuddy';
   return entry.key.startsWith('user_') ? 'commandcode' : 'opencode-go';
 }

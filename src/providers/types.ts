@@ -7,7 +7,7 @@
  * endpoint lives, and how to parse its usage response shape.
  */
 
-export type ProviderId = 'opencode-go' | 'commandcode';
+export type ProviderId = 'opencode-go' | 'commandcode' | 'workbuddy';
 
 /** Result of a provider smoke test (key verification ping). */
 export interface SmokeResult {

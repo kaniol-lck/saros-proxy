@@ -105,8 +105,8 @@ describe('commandcodeClientHeaders', () => {
 // ---------------------------------------------------------------------------
 
 describe('registry', () => {
-  it('registers both providers', () => {
-    expect(allProviders().map((p) => p.id).sort()).toEqual(['commandcode', 'opencode-go']);
+  it('registers all providers', () => {
+    expect(allProviders().map((p) => p.id).sort()).toEqual(['commandcode', 'opencode-go', 'workbuddy']);
   });
 
   it('isPlausibleKey accepts both formats and rejects junk', () => {

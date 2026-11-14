@@ -8,11 +8,13 @@
  */
 import { opencodeGoProvider } from './opencode-go.js';
 import { commandcodeProvider } from './commandcode.js';
+import { workbuddyProvider } from './workbuddy.js';
 import type { KeyProvider, ProviderId, SmokeResult } from './types.js';
 
 export * from './types.js';
 export { inferProvider, type KeyEntry } from './infer.js';
 export { opencodeGoProvider, parseOpencodeUsage } from './opencode-go.js';
+export { workbuddyProvider } from './workbuddy.js';
 export {
   commandcodeProvider,
   commandcodeClientHeaders,
@@ -22,7 +24,7 @@ export {
   COMMANDCODE_BILLING_PATH,
 } from './commandcode.js';
 
-const ALL_PROVIDERS: readonly KeyProvider[] = [opencodeGoProvider, commandcodeProvider];
+const ALL_PROVIDERS: readonly KeyProvider[] = [opencodeGoProvider, commandcodeProvider, workbuddyProvider];
 
 /** Get a provider by id. */
 export function getProvider(id: ProviderId): KeyProvider | undefined {
