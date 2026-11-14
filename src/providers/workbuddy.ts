@@ -58,9 +58,10 @@ export const workbuddyProvider: KeyProvider = {
   chatBasePath: '/v1',
 
   quickMatch(key: string) {
-    // wbk_ 前缀是 saros 侧的识别标记（旧约定）；生产 key 是裸 api_key，
-    // 靠 config.yaml 的 provider: workbuddy 显式声明路由，所以这里返回 maybe
-    return key.startsWith('wbk_') ? 'yes' : 'maybe';
+    // 生产 key 是裸 api_key（无结构前缀），必须靠 config.yaml 的
+    // provider: workbuddy 显式声明路由 —— 这里只能返回 no，
+    // 否则 isPlausibleKey 会对任意字符串放行，破坏 junk 过滤。
+    return key.startsWith('wbk_') ? 'yes' : 'no';
   },
 
   async smokeTest(key: string, timeoutMs = 15000): Promise<SmokeResult> {
