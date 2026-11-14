@@ -656,6 +656,18 @@ async function buildAttemptRequest(
           : undefined,
       })
     : { bodyText: ctx.bodyText };
+  // [wb2api-bridge] 把改写目标应用进 body（prepareOutboundRequest 不知道 catalog）。
+  if (ctx.workbuddyRewrite && provider.id === 'workbuddy') {
+    logger.info({ requestId: ctx.requestId, rewrite: ctx.workbuddyRewrite, keyLabel: key.label },
+      'wb2 rewrite applied');
+    try {
+      const parsed = JSON.parse(prepared.bodyText) as Record<string, unknown>;
+      if (typeof parsed.model === 'string' && parsed.model !== ctx.workbuddyRewrite) {
+        parsed.model = ctx.workbuddyRewrite;
+        prepared.bodyText = JSON.stringify(parsed);
+      }
+    } catch { /* body 非 JSON 时忽略 */ }
+  }
   const fetchOptions = buildFetchOptions({
     method: ctx.method,
     bodyText: prepared.bodyText,
