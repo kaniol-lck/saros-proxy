@@ -267,23 +267,45 @@ declare module 'hono' {
 // [dsh-patch proxy-fallback] opencode 兜底代理
 // ---------------------------------------------------------------------------
 
-let proxyAgentCache: unknown = null;
-let proxyAgentInitDone = false;
+interface ProxyAgentEntry {
+  url: string;
+  agent: unknown;
+}
 
-/** Lazily build an undici ProxyAgent from OPENCODE_PROXY (http(s) only, no socks). */
-async function getProxyAgent(): Promise<unknown> {
-  if (proxyAgentInitDone) return proxyAgentCache;
-  proxyAgentInitDone = true;
-  const url = process.env.OPENCODE_PROXY;
-  if (!url) return null;
+let proxyAgentCache: ProxyAgentEntry[] | null = null;
+
+/**
+ * Lazily build undici ProxyAgents from OPENCODE_PROXY.
+ * 支持逗号分隔多个代理（免费池的节点/端口会成片失效，单口吊死等于没有兜底）：
+ *   OPENCODE_PROXY=http://a:10809,http://b:10819
+ * 按配置顺序依次尝试，第一个成功的即用。
+ */
+async function getProxyAgents(): Promise<ProxyAgentEntry[]> {
+  if (proxyAgentCache) return proxyAgentCache;
+  const raw = process.env.OPENCODE_PROXY ?? '';
+  const urls = raw.split(',').map((s) => s.trim()).filter(Boolean);
+  if (urls.length === 0) return [];
+  const out: ProxyAgentEntry[] = [];
   try {
     const undici = await import('undici');
-    proxyAgentCache = new undici.ProxyAgent(url);
-    logger.info({ proxy: url.replace(/\/\/[^@/]*@/, '//***@') }, 'opencode proxy agent ready');
+    for (const url of urls) {
+      try {
+        out.push({ url, agent: new undici.ProxyAgent(url) });
+      } catch (err) {
+        logger.warn({ proxy: maskProxy(url), err: String((err as Error)?.message ?? err).slice(0, 120) },
+          'opencode proxy agent init failed (skipped)');
+      }
+    }
+    if (out.length) logger.info({ proxies: out.map((e) => maskProxy(e.url)) }, 'opencode proxy agents ready');
   } catch (err) {
-    logger.warn({ err: String((err as Error)?.message ?? err).slice(0, 160) }, 'opencode proxy agent init failed');
+    logger.warn({ err: String((err as Error)?.message ?? err).slice(0, 160) }, 'undici import failed');
   }
-  return proxyAgentCache;
+  proxyAgentCache = out;
+  return out;
+}
+
+function maskProxy(url: string): string {
+  return url.replace(/\/\/[^@/]*@/, '//***@');
 }
 
 /**
@@ -594,6 +616,7 @@ async function fetchWithHedge(
   const hedgeKey = peekAlternativeKeys(ctx.state, ctx.requestId, key.label)
     .find((cand) => providerCanServe(providerForKey(cand, ctx.config, ctx.modelId), ctx.modelId));
   if (!hedgeKey) {
+    logger.debug({ requestId: ctx.requestId, keyLabel: key.label }, 'hedge skipped: no eligible alternative key');
     return fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs);
   }
 
@@ -727,27 +750,29 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     );
     const withinSizeGate = !fallbackMaxBytes || ctx.bodyText.length <= fallbackMaxBytes;
     if (fallbackMode !== 'off' && withinSizeGate && fallbackProviders.includes(provider.id) && isNetworkishError(err)) {
-      try {
-        const agent = await getProxyAgent();
-        if (agent) {
-          const retryInit: RequestInit & { dispatcher?: unknown; duplex?: 'half' } = { ...fetchOptions, dispatcher: agent };
+      // [dsh-patch proxy-fallback] 多代理轮询：按 OPENCODE_PROXY 的顺序逐个尝试，
+      // 单个代理失败（ECONNRESET / 超时）立刻换下一个，全部失败才算兜底失败。
+      const proxies = await getProxyAgents();
+      for (const entry of proxies) {
+        try {
+          const retryInit: RequestInit & { dispatcher?: unknown; duplex?: 'half' } = { ...fetchOptions, dispatcher: entry.agent };
           const retried = await fetchWithTimeout(upstreamUrl, retryInit, fallbackTimeoutMs);
           if (retried.ok) {
             logger.info({ requestId: ctx.requestId, keyLabel: key.label, model: ctx.modelId, provider: provider.id,
-              via: 'proxy', timeoutMs: fallbackTimeoutMs, bodyBytes: ctx.bodyText.length },
+              via: 'proxy', proxy: maskProxy(entry.url), timeoutMs: fallbackTimeoutMs, bodyBytes: ctx.bodyText.length },
               'fallback via proxy succeeded');
             markKeySucceeded(ctx.state, key.label);
             completeRequest(ctx.state, ctx.requestId, true);
             return { kind: 'done', response: await ctx.onSuccess(retried, ctx.state, ctx.requestId, key.label) };
           }
           logger.warn({ requestId: ctx.requestId, keyLabel: key.label, provider: provider.id,
-            status: retried.status, via: 'proxy' }, 'fallback via proxy got non-ok');
+            proxy: maskProxy(entry.url), status: retried.status, via: 'proxy' }, 'fallback via proxy got non-ok');
+        } catch (fallbackErr) {
+          logger.warn({ requestId: ctx.requestId, keyLabel: key.label, provider: provider.id,
+            proxy: maskProxy(entry.url), timeoutMs: fallbackTimeoutMs, bodyBytes: ctx.bodyText.length,
+            err: String((fallbackErr as Error)?.message ?? fallbackErr).slice(0, 140) },
+            'fallback via proxy failed');
         }
-      } catch (fallbackErr) {
-        logger.warn({ requestId: ctx.requestId, keyLabel: key.label, provider: provider.id,
-          timeoutMs: fallbackTimeoutMs, bodyBytes: ctx.bodyText.length,
-          err: String((fallbackErr as Error)?.message ?? fallbackErr).slice(0, 140) },
-          'fallback via proxy failed');
       }
     }
     return handleNetworkError(err, ctx, key);

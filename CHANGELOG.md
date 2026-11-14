@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Proxy fallback tries multiple proxies** (`OPENCODE_PROXY` accepts a comma-separated list): the free pool loses whole ports at a time (tier-2 `10813`/`10821` both died while tier-1 stayed up), so a single endpoint made the fallback silently useless. Each proxy is tried in order until one succeeds; success/failure logs now carry the `proxy` used.
+
+
 ### Added
 
 - **Hedged streaming requests** (`[dsh-patch hedge]`, `HEDGE_AFTER_MS`, default off): when a streaming request has not received response headers within `HEDGE_AFTER_MS`, the same request is started in parallel on another eligible key; whichever produces headers first wins and the loser is aborted. This avoids waiting out the whole upstream timeout when one provider is resetting connections.

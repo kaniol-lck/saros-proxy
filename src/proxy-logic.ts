@@ -207,7 +207,9 @@ export function peekAlternativeKeys(
   const ctx = state.activeRequests.get(requestId);
   const tried = new Set<string>(ctx?.triedKeys ?? []);
   tried.add(excludeLabel);
-  const filter = ctx?.providerFilter;
+  // 只在"模型被 provider 钉死"时才套用 providerFilter；否则把过滤权交给调用方的
+  // providerCanServe（它会按"该 provider 能否服务此 model"判定，允许跨 provider 对冲）。
+  const filter = ctx?.pinned ? ctx?.providerFilter : undefined;
   const out: KeySnapshot[] = [];
   for (const key of state.keys) {
     if (tried.has(key.label)) continue;
