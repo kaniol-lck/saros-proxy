@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Proxy endpoint cooldown** (`[dsh-patch proxy-cooldown]`): an endpoint that fails `PROXY_FAIL_THRESHOLD` times in a row (default 2) is skipped for `PROXY_COOLDOWN_MS` (default 5 min), and a single success clears it. The free pool loses whole ports for tens of minutes, so without memory most fallback attempts were spent hammering dead endpoints.
+
+
 ### Changed
 
 - **Proxy fallback tries multiple proxies** (`OPENCODE_PROXY` accepts a comma-separated list): the free pool loses whole ports at a time (tier-2 `10813`/`10821` both died while tier-1 stayed up), so a single endpoint made the fallback silently useless. Each proxy is tried in order until one succeeds; success/failure logs now carry the `proxy` used.

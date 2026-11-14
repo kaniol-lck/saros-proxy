@@ -309,6 +309,43 @@ function maskProxy(url: string): string {
 }
 
 /**
+ * [dsh-patch proxy-cooldown] 代理口短期记忆。
+ * 免费池会整口失效且持续几十分钟，不做记忆就会把每次兜底都浪费在死口上
+ * （实测 1 小时 352 次兜底失败里绝大多数是打到已死端口）。
+ * 某口连续失败 PROXY_FAIL_THRESHOLD(默认 2) 次后，跳过 PROXY_COOLDOWN_MS(默认 5 分钟)；
+ * 成功一次即清零。冷却期内的口不参与轮询，全部在冷却中时才退化为按原顺序尝试。
+ */
+const proxyCooldown = new Map<string, { fails: number; until: number }>();
+
+function proxyCooldownMs(): number {
+  return Number(process.env.PROXY_COOLDOWN_MS ?? 0) || 5 * 60_000;
+}
+
+function proxyFailThreshold(): number {
+  return Number(process.env.PROXY_FAIL_THRESHOLD ?? 0) || 2;
+}
+
+function isProxyCoolingDown(url: string): boolean {
+  const st = proxyCooldown.get(url);
+  return !!st && st.until > Date.now();
+}
+
+function noteProxyResult(url: string, ok: boolean): void {
+  if (ok) {
+    proxyCooldown.delete(url);
+    return;
+  }
+  const st = proxyCooldown.get(url) ?? { fails: 0, until: 0 };
+  st.fails += 1;
+  if (st.fails >= proxyFailThreshold()) {
+    st.until = Date.now() + proxyCooldownMs();
+    logger.warn({ proxy: maskProxy(url), fails: st.fails, cooldownMs: proxyCooldownMs() },
+      'proxy cooling down after consecutive failures');
+  }
+  proxyCooldown.set(url, st);
+}
+
+/**
  * [dsh-patch same-key-retry] 值得"同 key 立即重试"的网络错误。
  * 排除 Connect Timeout：那说明到上游的路径整体不通，重试只会再等一个超时。
  */
@@ -752,11 +789,20 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     if (fallbackMode !== 'off' && withinSizeGate && fallbackProviders.includes(provider.id) && isNetworkishError(err)) {
       // [dsh-patch proxy-fallback] 多代理轮询：按 OPENCODE_PROXY 的顺序逐个尝试，
       // 单个代理失败（ECONNRESET / 超时）立刻换下一个，全部失败才算兜底失败。
-      const proxies = await getProxyAgents();
+      const allProxies = await getProxyAgents();
+      // 冷却中的口优先跳过；若全在冷却则退回全量（避免因为记忆把兜底彻底关死）
+      const liveProxies = allProxies.filter((e) => !isProxyCoolingDown(e.url));
+      const proxies = liveProxies.length ? liveProxies : allProxies;
+      if (liveProxies.length < allProxies.length) {
+        logger.debug({ requestId: ctx.requestId,
+          skipped: allProxies.filter((e) => isProxyCoolingDown(e.url)).map((e) => maskProxy(e.url)) },
+          'proxy fallback skipping cooling-down endpoints');
+      }
       for (const entry of proxies) {
         try {
           const retryInit: RequestInit & { dispatcher?: unknown; duplex?: 'half' } = { ...fetchOptions, dispatcher: entry.agent };
           const retried = await fetchWithTimeout(upstreamUrl, retryInit, fallbackTimeoutMs);
+          noteProxyResult(entry.url, retried.ok);
           if (retried.ok) {
             logger.info({ requestId: ctx.requestId, keyLabel: key.label, model: ctx.modelId, provider: provider.id,
               via: 'proxy', proxy: maskProxy(entry.url), timeoutMs: fallbackTimeoutMs, bodyBytes: ctx.bodyText.length },
@@ -768,6 +814,7 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
           logger.warn({ requestId: ctx.requestId, keyLabel: key.label, provider: provider.id,
             proxy: maskProxy(entry.url), status: retried.status, via: 'proxy' }, 'fallback via proxy got non-ok');
         } catch (fallbackErr) {
+          noteProxyResult(entry.url, false);
           logger.warn({ requestId: ctx.requestId, keyLabel: key.label, provider: provider.id,
             proxy: maskProxy(entry.url), timeoutMs: fallbackTimeoutMs, bodyBytes: ctx.bodyText.length,
             err: String((fallbackErr as Error)?.message ?? fallbackErr).slice(0, 140) },
