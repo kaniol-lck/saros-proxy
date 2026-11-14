@@ -127,8 +127,6 @@ export const workbuddyProvider: KeyProvider = {
     if (ids.length === 0) return null; // callers fall back to warm via fetchCatalog
     const g = REALM + ':' + bareName;
     if (ids.includes(g)) return g;
-    const c = 'cn:' + bareName;
-    if (ids.includes(c)) return c;
     const gHit = ids.find((id) => id.startsWith(REALM + ':') && id.slice(REALM.length + 1).startsWith(bareName));
     return gHit ?? null;
   },
