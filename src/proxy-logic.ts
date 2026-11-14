@@ -35,6 +35,11 @@ interface ApiKey {
    * not a transient fault.
    */
   entitled: boolean;
+  /**
+   * [dsh-patch quota-out] 月度/周期额度撞顶后，禁用到上游声明的重置时刻。
+   * 与熔断不同：这不是瞬态故障，60s 冷却只会造成"复活→立刻 429→再熔断"的循环。
+   */
+  quotaOutUntil: number | null;
   /** Smooth weighted round-robin state (nginx-style). */
   currentWeight: number;
 }
@@ -87,7 +92,7 @@ export interface ProxyState {
  *   lockups ("all keys unavailable") when the upstream hung. Failover still
  *   tries the next key for this request.
  */
-export type ErrorType = 'KeyFault' | 'RequestFault' | 'ServerFault' | 'NetworkFault';
+export type ErrorType = 'KeyFault' | 'ServerFault' | 'RequestFault' | 'NetworkFault' | 'QuotaExhausted';
 
 // ---------------------------------------------------------------------------
 // State Factory
@@ -111,6 +116,7 @@ export function createProxyState(
       disabledAt: null,
       usagePercent: null,
       entitled: true,
+  quotaOutUntil: null,
       currentWeight: 0,
     })),
     currentIndex: 0,
@@ -142,6 +148,12 @@ function isKeyAvailable(state: ProxyState, key: ApiKey): boolean {
   // plan for this provider must not be retried until the usage refresh
   // clears the flag.
   if (!key.entitled) return false;
+
+  // [dsh-patch quota-out] 额度撞顶禁用到重置时刻；到期自动回到轮询（无 lazy 状态残留）。
+  if (key.quotaOutUntil !== null) {
+    if (Date.now() < key.quotaOutUntil) return false;
+    key.quotaOutUntil = null;
+  }
 
   if (key.enabled && key.consecutiveFailures < state.circuitBreakerThreshold) {
     return true;
@@ -319,6 +331,19 @@ export function updateKeyUsage(state: ProxyState, usage: Map<string, number>): v
  * refresh flips the flag back as soon as the account can serve requests
  * again.
  */
+/**
+ * [dsh-patch quota-out] 把 key 禁用到指定时刻（月度额度重置）。
+ * 不动熔断计数 —— 这是确定性禁用，到期由 isKeyAvailable 自动恢复。
+ */
+export function setKeyQuotaOut(state: ProxyState, keyLabel: string, untilMs: number): void {
+  const key = state.keys.find((k) => k.label === keyLabel);
+  if (!key) return;
+  key.quotaOutUntil = Math.max(untilMs, Date.now() + 60_000);
+  key.enabled = true;            // 避免熔断冷却先挡住
+  key.consecutiveFailures = 0;   // 重置失败计数
+
+}
+
 export function setKeyEntitlement(state: ProxyState, keyLabel: string, entitled: boolean): void {
   const key = state.keys.find((k) => k.label === keyLabel);
   if (key) key.entitled = entitled;
@@ -500,6 +525,12 @@ export function markKeyFailed(
   errorType: ErrorType,
 ): void {
   if (errorType === 'RequestFault' || errorType === 'NetworkFault') return;
+  if (errorType === 'QuotaExhausted') {
+    // 由调用方先解析重置时间并调 setKeyQuotaOut；这里只是兜底（1 小时后重试）。
+    // 纯逻辑模块不打日志，观察由 proxy.ts 侧负责。
+    setKeyQuotaOut(state, keyLabel, Date.now() + 3600_000);
+    return;
+  }
 
   const key = state.keys.find((k) => k.label === keyLabel);
   if (!key) return;
@@ -558,7 +589,12 @@ export function classifyHttpError(status: number, _body?: string): ErrorType {
     if (_body && /ModelError|not supported/i.test(_body)) return 'RequestFault';
     return 'KeyFault';
   }
-  if (status === 429) return 'ServerFault';
+  if (status === 429) {
+    // [dsh-patch quota-out] 429 且 body 是额度耗尽（带 resets / UsageLimitError）
+    // → 不是瞬态限流，禁用到重置时刻，避免 60s 冷却循环。
+    if (_body && /UsageLimitError|usage limit reached|resets in/i.test(_body)) return 'QuotaExhausted';
+    return 'ServerFault';
+  }
   if (status === 400 || status === 403 || status === 404 || status === 422) return 'RequestFault';
   if (status === 500 || status === 502 || status === 503) {
     // Server errors: if the body hints at a quota/balance issue treat as KeyFault

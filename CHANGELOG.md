@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Quota exhaustion no longer loops the circuit breaker** (`[dsh-patch quota-out]`): a 429 whose body reports a usage limit (`GoUsageLimitError`, `resets in Nd`) previously counted as `ServerFault`, so the key was disabled for 60s, immediately re-hit the same 429, and produced endless `All API keys are temporarily unavailable` 503s. `classifyHttpError` now returns `QuotaExhausted`, the reset delay is parsed from the body (`resets in 2d` / `resets at <ts>`), and the key is disabled until that moment via `setKeyQuotaOut` (`ApiKey.quotaOutUntil`); `isKeyAvailable` re-admits it automatically when the window resets. Stream-internal 429 errors take the same path.
+
+
+### Added
+
 - **Proxy endpoint cooldown** (`[dsh-patch proxy-cooldown]`): an endpoint that fails `PROXY_FAIL_THRESHOLD` times in a row (default 2) is skipped for `PROXY_COOLDOWN_MS` (default 5 min), and a single success clears it. The free pool loses whole ports for tens of minutes, so without memory most fallback attempts were spent hammering dead endpoints.
 
 

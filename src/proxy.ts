@@ -25,6 +25,7 @@ import {
   type ProxyState,
   type KeySnapshot,
   peekAlternativeKeys,
+  setKeyQuotaOut,
 } from './proxy-logic.js';
 import type { ProxyConfig } from './config.js';
 import { logger, maskKey } from './logger.js';
@@ -901,6 +902,30 @@ function buildFetchOptions(opts: {
   return options;
 }
 
+/**
+ * [dsh-patch quota-out] 从 429 body 里提取额度重置时间。
+ * 支持两种形态：opencode-go 的 "resets in 2d" / "(monthly, resets in 2d)"，
+ * 以及 "resets at 2026-11-17T..." 绝对时间。都找不到时默认 2 小时后重试。
+ */
+function quotaResetFrom(body: string): number {
+  const now = Date.now();
+  const abs = body.match(/resets?\s+at\s+(\d{4}-\d{2}-\d{2}[T\s]\d{2}:\d{2}(?::\d{2})?)/i);
+  if (abs) {
+    const t = Date.parse(abs[1].replace(' ', 'T'));
+    if (Number.isFinite(t)) return t;
+  }
+  const rel = body.match(/resets?\s+in\s+(\d+)\s*(d|day|h|hr|hour|m|min|minute)/i);
+  if (rel) {
+    const n = Number(rel[1]);
+    const unit = rel[2].toLowerCase();
+    const ms = unit.startsWith('d') ? n * 86_400_000
+      : unit.startsWith('h') ? n * 3_600_000
+      : n * 60_000;
+    return now + ms;
+  }
+  return now + 2 * 3600_000;
+}
+
 async function handleUpstreamErrorResponse(
   response: Response,
   ctx: RetryContext,
@@ -915,6 +940,16 @@ async function handleUpstreamErrorResponse(
     // Client error — don't retry, don't penalise the key
     completeRequest(ctx.state, ctx.requestId, false);
     return { kind: 'done', response: buildClientErrorResponse(response.status, errorBody, ctx.requestId) };
+  }
+
+  // [dsh-patch quota-out] 429 额度撞顶：解析 "resets in 2d / 5h / 30m" 并禁用到该时刻。
+  // QuotaExhausted 不进熔断计数，由 isKeyAvailable 在重置后自动恢复。
+  if (errorType === 'QuotaExhausted') {
+    const until = quotaResetFrom(errorBody);
+    logger.warn({ requestId: ctx.requestId, keyLabel: key.label, status: response.status,
+      untilIso: new Date(until).toISOString() }, 'quota exhausted — key disabled until reset');
+    setKeyQuotaOut(ctx.state, key.label, until);
+    return { kind: 'retry', lastError: new Error(`quota exhausted until ${new Date(until).toISOString()}`) };
   }
 
   // KeyFault or ServerFault — penalise the key and retry
@@ -1243,7 +1278,16 @@ function wrapStreamWithErrorDetection(
             const parsed = JSON.parse(dataLine.slice(5).trim());
             if (parsed && (parsed.error || parsed.type === 'error')) {
               logger.warn({ requestId, keyLabel }, 'Error detected in stream');
-              markKeyFailed(state, keyLabel, 'ServerFault');
+              // [dsh-patch quota-out] 流内错误也识别额度撞顶（body 里带 resets）
+              const errText = JSON.stringify(parsed).slice(0, 600);
+              if (parsed.error && /UsageLimitError|usage limit reached|resets in/i.test(errText)) {
+                const until = quotaResetFrom(errText);
+                setKeyQuotaOut(state, keyLabel, until);
+                logger.warn({ requestId, keyLabel, untilIso: new Date(until).toISOString() },
+                  'quota exhausted in stream — key disabled until reset');
+              } else {
+                markKeyFailed(state, keyLabel, 'ServerFault');
+              }
               // Whatever the upstream reported before failing was consumed.
               bookUsage();
               controller.enqueue(
