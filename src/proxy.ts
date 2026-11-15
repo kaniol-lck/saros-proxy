@@ -1023,6 +1023,13 @@ function buildFetchOptions(opts: {
   if (opts.kind === 'standard' && (opts.method === 'GET' || opts.method === 'HEAD')) return options;
   options.body = opts.bodyText;
   options.duplex = 'half';
+  // [dsh-patch content-length] buildUpstreamHeaders 会丢掉客户端原始的
+  // content-length（body 可能被改写，长度会变），但**丢掉后必须重算**：
+  // 没有 content-length 时 undici 退化为 Transfer-Encoding: chunked，
+  // 而 api.commandcode.ai（Cloudflare）对 ≥30KB 的 chunked 上传直接掐连接
+  // （UND_ERR_SOCKET / other side closed，实测 60KB 裸传 2/2 失败、
+  // 带 content-length 则 200）。这里按定稿 body 的字节数写回。
+  headers.set('content-length', String(Buffer.byteLength(opts.bodyText, 'utf8')));
   return options;
 }
 
