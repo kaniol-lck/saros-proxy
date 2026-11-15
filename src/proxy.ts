@@ -686,14 +686,19 @@ async function buildAttemptRequest(
       } catch { /* 缓存失败则保持裸名，wb2api 自己也会拒 */ }
     }
     const ids = wbModelCache.get("ids")?.ids ?? [];
-    const g = "global:" + ctx.modelId;
-    // [wb2api-bridge] 只走 global：cn 区账号（五羊飞）不支持 deepseek 系模型，
-    // catalog 里虽有同名条目，但先试 cn 会 503 浪费一次上游往返。
-    if (ids.includes(g)) ctx.workbuddyRewrite = g;
-    else {
-      const hit = ids.find((id) => id.startsWith("global:") && id.slice(7).startsWith(ctx.modelId ?? ""));
-      if (hit) ctx.workbuddyRewrite = hit;
-    }
+    const bare = (ctx.modelId ?? "").toLowerCase();
+    // [wb2api-bridge] 优先级：global 精确 → cn 精确 → global 前缀 → cn 前缀。
+    // 两边都有的模型优先 global（cn 账号服务不了 deepseek 系，先试 cn 会白 503）；
+    // cn 独有模型（如 hy3-x）则用 cn，从而"并"进全部 wb2api 模型。
+    const exact = (realm: string): string | undefined =>
+      ids.find((id) => id.toLowerCase() === realm + ":" + bare);
+    const prefixed = (realm: string): string | undefined =>
+      ids.find((id) => {
+        const low = id.toLowerCase();
+        return low.startsWith(realm + ":") && low.slice(realm.length + 1).startsWith(bare);
+      });
+    const target = exact("global") ?? exact("cn") ?? prefixed("global") ?? prefixed("cn");
+    if (target) ctx.workbuddyRewrite = target;
   }
   const upstreamUrl = resolveUpstreamUrl(ctx.config, provider, ctx.path);
   const sessionHeader = provider.sessionHeader;

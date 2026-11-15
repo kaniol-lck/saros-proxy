@@ -23,10 +23,19 @@ interface CatalogModel { id: string }
 
 let catalogCache: { at: number; ids: string[] } | null = null;
 
+/**
+ * [dsh-patch wb2api-catalog] wb2api 的 /v1/models 需要鉴权，而 KeyProvider
+ * 的 fetchCatalog() 签名不带 key。这里记住首次见到的 api_key
+ * （smokeTest / queryUsage 都会拿到），供 catalogIds() 使用。
+ */
+let apiKeyCache: string | null = null;
+
 async function catalogIds(timeoutMs: number): Promise<string[]> {
   if (catalogCache && Date.now() - catalogCache.at < 300_000) return catalogCache.ids;
   try {
-    const r = await fetch(BASE_URL + '/v1/models', { signal: AbortSignal.timeout(timeoutMs) });
+    const headers: Record<string, string> = { accept: 'application/json' };
+    if (apiKeyCache) headers.authorization = 'Bearer ' + apiKeyCache;
+    const r = await fetch(BASE_URL + '/v1/models', { headers, signal: AbortSignal.timeout(timeoutMs) });
     if (!r.ok) return catalogCache?.ids ?? [];
     const j = (await r.json()) as { data?: CatalogModel[] };
     const ids = (j.data ?? []).map((m) => String(m.id));
@@ -70,7 +79,10 @@ export const workbuddyProvider: KeyProvider = {
         headers: { authorization: 'Bearer ' + key },
         signal: AbortSignal.timeout(timeoutMs),
       });
-      if (r.ok) return { provider: this.id, status: 'valid', httpStatus: r.status };
+      if (r.ok) {
+        apiKeyCache = key;
+        return { provider: this.id, status: 'valid', httpStatus: r.status };
+      }
       if (r.status === 401 || r.status === 403) return { provider: this.id, status: 'invalid', httpStatus: r.status };
       return { provider: this.id, status: 'error', httpStatus: r.status };
     } catch (err) {
@@ -83,6 +95,7 @@ export const workbuddyProvider: KeyProvider = {
   },
 
   async queryUsage(apiKey: string, _baseUrl: string, timeoutMs: number) {
+    if (apiKey) apiKeyCache = apiKey;
     const usage = await panelJson(PANEL_USAGE_PATH, apiKey, timeoutMs);
     const byAccount = (usage?.credit_by_account ?? []) as Array<Record<string, unknown>>;
     const credits = byAccount.reduce((s, a) => s + Number(a.credits ?? 0), 0);
@@ -112,8 +125,15 @@ export const workbuddyProvider: KeyProvider = {
 
   modelAffinity(modelId: string): ModelAffinity {
     if (modelId.startsWith('global:') || modelId.startsWith('cn:')) return 'yes';
-    // bare names: 'maybe' — resolveNativeId decides with the live catalog
-    return 'maybe';
+    const ids = catalogCache?.ids ?? [];
+    // 目录还没加载：不否决（'maybe'），交给 resolveNativeId 在请求路径上判
+    if (ids.length === 0) return 'maybe';
+    const bare = modelId.toLowerCase();
+    const hit = ids.some((id) => {
+      const i = id.toLowerCase();
+      return i === 'global:' + bare || i === 'cn:' + bare;
+    });
+    return hit ? 'yes' : 'no';
   },
 
   modelAffinityByName(bareName: string): ModelAffinity {
@@ -121,13 +141,23 @@ export const workbuddyProvider: KeyProvider = {
   },
 
   resolveNativeId(bareName: string): string | null {
-    // 关键路径上的冷启动允许一次同步拉取（约 100ms，缓存 5 分钟）——
-    // 否则 wb2api 会收到裸名并 503（它要求 global:/cn: 前缀）。
     const ids = catalogCache?.ids ?? [];
     if (ids.length === 0) return null; // callers fall back to warm via fetchCatalog
-    const g = REALM + ':' + bareName;
-    if (ids.includes(g)) return g;
-    const gHit = ids.find((id) => id.startsWith(REALM + ':') && id.slice(REALM.length + 1).startsWith(bareName));
-    return gHit ?? null;
+    const bare = bareName.toLowerCase();
+    // 1) global 精确 → 2) cn 精确 —— 两边都有的模型优先 global
+    //    （cn 账号服务不了 deepseek 系，先试 cn 会白白 503 一次）
+    const g = REALM + ':' + bare;
+    const exactG = ids.find((id) => id.toLowerCase() === g);
+    if (exactG) return exactG;
+    const c = 'cn:' + bare;
+    const exactC = ids.find((id) => id.toLowerCase() === c);
+    if (exactC) return exactC;
+    // 3) global 前缀 → 4) cn 前缀（例如 hy4 → global:hy4-preview / cn:hy4std）
+    const prefixOf = (realm: string): string | undefined =>
+      ids.find((id) => {
+        const low = id.toLowerCase();
+        return low.startsWith(realm + ':') && low.slice(realm.length + 1).startsWith(bare);
+      });
+    return prefixOf('global') ?? prefixOf('cn') ?? null;
   },
 };
