@@ -336,6 +336,29 @@ function proxyFailThreshold(): number {
   return Number(process.env.PROXY_FAIL_THRESHOLD ?? 0) || 2;
 }
 
+/**
+ * [dsh-patch proxy-mode] 主通道走哪条路：
+ *   direct（默认）—— 直连优先，失败后走代理兜底（历史行为）
+ *   first        —— 代理优先；代理全挂时再直连一次
+ *   only         —— 只走代理
+ * 本机线路（NAS → 境外 API）直连必然失败，direct 模式下每个请求都要白撞一次
+ * 直连，既多 ~1s 延迟，又把 NetworkFault 计数打高导致代理端点频繁冷却级联。
+ */
+function proxyMode(): 'direct' | 'first' | 'only' {
+  const raw = (process.env.PROXY_MODE ?? process.env.OPENCODE_PROXY_MODE ?? 'direct').toLowerCase();
+  if (raw === 'first' || raw === 'only') return raw;
+  return 'direct';
+}
+
+/** 取一个可用代理（优先未冷却的），供"代理优先"作为主通道。 */
+async function pickPrimaryProxy(): Promise<ProxyAgentEntry | null> {
+  const all = await getProxyAgents();
+  if (!all.length) return null;
+  const live = all.filter((e) => !isProxyCoolingDown(e.url));
+  const pool = live.length ? live : all;
+  return pool[0] ?? null;
+}
+
 function isProxyCoolingDown(url: string): boolean {
   const st = proxyCooldown.get(url);
   return !!st && st.until > Date.now();
@@ -570,6 +593,8 @@ interface RetryContext {
   sameKeyRetryBudget?: number;
   /** [dsh-patch wb2api-bridge] workbuddy 的模型前缀改写目标（global:xxx）。 */
   workbuddyRewrite?: string;
+  /** [dsh-patch proxy-mode] 主通道已用的代理 URL（兜底时跳过它，避免同一端口重试）。 */
+  primaryProxyUrl?: string;
 }
 
 type AttemptResult =
@@ -699,6 +724,14 @@ async function buildAttemptRequest(
     provider,
     sessionId: prepared.sessionId,
   }) as RequestInit & { duplex?: 'half' };
+  // [dsh-patch proxy-mode] first/only：主通道直接挂代理 dispatcher
+  if (proxyMode() !== 'direct') {
+    const entry = await pickPrimaryProxy();
+    if (entry) {
+      (fetchOptions as RequestInit & { dispatcher?: unknown }).dispatcher = entry.agent;
+      ctx.primaryProxyUrl = entry.url;
+    }
+  }
   return { provider, upstreamUrl, fetchOptions };
 }
 
@@ -871,6 +904,8 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
           'proxy fallback skipping cooling-down endpoints');
       }
       for (const entry of proxies) {
+        // 主通道已经用过这个端口，别再撞一次
+        if (ctx.primaryProxyUrl && entry.url === ctx.primaryProxyUrl) continue;
         try {
           const retryInit: RequestInit & { dispatcher?: unknown; duplex?: 'half' } = { ...fetchOptions, dispatcher: entry.agent };
           const retried = await fetchWithTimeout(upstreamUrl, retryInit, fallbackTimeoutMs);
@@ -891,6 +926,24 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
             proxy: maskProxy(entry.url), timeoutMs: fallbackTimeoutMs, bodyBytes: ctx.bodyText.length,
             err: String((fallbackErr as Error)?.message ?? fallbackErr).slice(0, 140) },
             'fallback via proxy failed');
+        }
+      }
+      // [dsh-patch proxy-mode] first 模式：代理全挂时补一次直连（去掉 dispatcher）
+      if (proxyMode() === 'first') {
+        try {
+          const directInit: RequestInit & { dispatcher?: unknown } = { ...fetchOptions };
+          delete directInit.dispatcher;
+          const retried = await fetchWithTimeout(upstreamUrl, directInit, fallbackTimeoutMs);
+          if (retried.ok) {
+            logger.info({ requestId: ctx.requestId, keyLabel: key.label, provider: provider.id, via: 'direct' },
+              'direct retry after proxies failed');
+            markKeySucceeded(ctx.state, key.label);
+            completeRequest(ctx.state, ctx.requestId, true);
+            return { kind: 'done', response: await ctx.onSuccess(retried, ctx.state, ctx.requestId, key.label) };
+          }
+        } catch (directErr) {
+          logger.warn({ requestId: ctx.requestId, keyLabel: key.label,
+            err: String((directErr as Error)?.message ?? directErr).slice(0, 120) }, 'direct retry failed');
         }
       }
     }
@@ -1322,6 +1375,23 @@ function wrapStreamWithErrorDetection(
     if (counts) logger.info({ requestId, keyLabel, tokIn: counts.tokIn, tokOut: counts.tokOut }, 'request tokens');
   };
 
+  // [dsh-patch stream-double-close] 客户端提前断开 / 上游刚结束时，
+  // pull 与 catch 两路可能都去 close()，Node 会抛
+  // TypeError: Invalid state: Controller is already closed（近 20 分钟 76 次）。
+  let streamClosed = false;
+  const closeStream = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
+    if (streamClosed) return;
+    streamClosed = true;
+    try { controller.close(); } catch { /* already closed */ }
+  };
+  const enqueueStream = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    chunk: Uint8Array,
+  ): void => {
+    if (streamClosed) return;
+    try { controller.enqueue(chunk); } catch { streamClosed = true; }
+  };
+
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
@@ -1329,7 +1399,7 @@ function wrapStreamWithErrorDetection(
 
         if (done) {
           bookUsage();
-          controller.close();
+          closeStream(controller);
           return;
         }
 
@@ -1361,12 +1431,13 @@ function wrapStreamWithErrorDetection(
               }
               // Whatever the upstream reported before failing was consumed.
               bookUsage();
-              controller.enqueue(
+              enqueueStream(
+                controller,
                 encoder.encode(
                   'data: {"type":"proxy_error","message":"Upstream stream error"}\n\n',
                 ),
               );
-              controller.close();
+              closeStream(controller);
               return;
             }
             // Intermediate chunks send `usage: null`; the counts arrive on the
@@ -1383,17 +1454,18 @@ function wrapStreamWithErrorDetection(
         }
 
         // Pass through the chunk as-is
-        controller.enqueue(value);
+        enqueueStream(controller, value);
       } catch (err) {
         logger.error({ requestId, keyLabel, err }, 'Stream read error');
         markKeyFailed(state, keyLabel, 'ServerFault');
         bookUsage();
-        controller.enqueue(
+        enqueueStream(
+          controller,
           encoder.encode(
             'data: {"type":"proxy_error","message":"Stream interrupted"}\n\n',
           ),
         );
-        controller.close();
+        closeStream(controller);
       }
     },
 
