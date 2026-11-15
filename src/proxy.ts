@@ -48,6 +48,9 @@ const CANONICAL_CHAT_BASE = '/zen/go/v1';
 // [dsh-patch wb2api-bridge] workbuddy 的模型目录缓存（/v1/models 需要鉴权）
 const wbModelCache = new Map<string, { at: number; ids: string[] }>();
 
+// [dsh-patch catalog-warm] 每个 provider 的目录预热时间戳（5 分钟节流）
+const catalogWarmCache = new Map<string, number>();
+
 /**
  * Resolve the upstream URL for one attempt: per-provider base URL + path
  * remapping. Clients always speak canonical saros routes (/zen/go/v1/<rest>,
@@ -622,6 +625,21 @@ async function buildAttemptRequest(
   key: KeySnapshot,
 ): Promise<{ provider: KeyProvider; upstreamUrl: string; fetchOptions: RequestInit & { duplex?: 'half' } }> {
   const provider = providerForKey(key, ctx.config, ctx.modelId);
+  // [dsh-patch catalog-warm] 目录是懒加载的，而 model 改写（resolveNativeId）
+  // 依赖它：冷启动时裸名会被原样发给 cc → 400「Model ... is not supported on
+  // this endpoint」。这里**后台**预热（不阻塞请求，每 provider 5 分钟一次）——
+  // 阻塞式预热会在测试和首包上拖慢；而 cc 的选点本身在目录就绪前会答 'no'，
+  // 所以背景预热足以保证真正发给 cc 时目录已在。
+  // 只在"裸名、且未被 @provider 显式 pin"时预热：pin 过的请求意味着调用方
+  // 自己指定了目标，预热只会多插一次上游请求（也会打乱既有测试的调用序）。
+  if (ctx.modelId && !ctx.modelId.includes('/') && !parseProviderSuffix(ctx.modelId)
+      && provider.fetchCatalog && provider.resolveNativeId) {
+    const warmed = catalogWarmCache.get(provider.id);
+    if (!warmed || Date.now() - warmed > 300_000) {
+      catalogWarmCache.set(provider.id, Date.now());
+      void provider.fetchCatalog(8000).catch(() => undefined);
+    }
+  }
   // [dsh-patch wb2api-bridge] workbuddy 的 /v1/models 需要鉴权，provider 级
   // fetchCatalog 拉不到；这里带 key 拉一次并缓存（5 分钟），供 model 前缀改写。
   if (provider.id === 'workbuddy' && ctx.modelId && !ctx.modelId.includes(':')) {
