@@ -92,7 +92,14 @@ export interface ProxyState {
  *   lockups ("all keys unavailable") when the upstream hung. Failover still
  *   tries the next key for this request.
  */
-export type ErrorType = 'KeyFault' | 'ServerFault' | 'RequestFault' | 'NetworkFault' | 'QuotaExhausted';
+export type ErrorType =
+  | 'KeyFault'
+  | 'ServerFault'
+  | 'RequestFault'
+  | 'NetworkFault'
+  | 'QuotaExhausted'
+  /** [dsh-patch model-affinity] 这家 provider 服务不了这个模型（换一家即可，key 本身没问题）。 */
+  | 'ModelUnavailable';
 
 // ---------------------------------------------------------------------------
 // State Factory
@@ -599,6 +606,15 @@ export function classifyHttpError(status: number, _body?: string): ErrorType {
   // 暂时服务不了该模型"——换 provider（cc/oc）可能成功，必须 failover，
   // 不能像普通 400 那样透传给客户端。
   if (status === 400 && _body && /per-model cooldown/i.test(_body)) return 'ServerFault';
+  // [dsh-patch model-affinity] "这家服务不了这个模型" ≠ 客户端请求有错。
+  // 换一个 provider 往往就能成（wb2api 有全套模型），所以归为 ModelUnavailable：
+  // 触发 failover，但不惩罚 key。否则 403 会原样透传给客户端，
+  // DSH 再把它显示成「API 密钥无效」（已实测踩过）。
+  if (status === 403 && _body && /MODEL_NOT_IN_PLAN/i.test(_body)) return 'ModelUnavailable';
+  if (status === 400 && _body && /is not supported on this endpoint/i.test(_body)) return 'ModelUnavailable';
+  if ((status === 400 || status === 503) && _body && /model_unavailable|model_blocked/i.test(_body)) {
+    return 'ModelUnavailable';
+  }
   if (status === 400 || status === 403 || status === 404 || status === 422) return 'RequestFault';
   if (status === 500 || status === 502 || status === 503) {
     // Server errors: if the body hints at a quota/balance issue treat as KeyFault

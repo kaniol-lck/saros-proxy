@@ -1121,6 +1121,14 @@ async function handleUpstreamErrorResponse(
   logUpstreamError(ctx.requestId, key, response.status, errorType, errorBody, ctx.kind);
   captureFailedRequest(ctx, response.status, errorBody);
 
+  // [dsh-patch model-affinity] 这家服务不了这个模型 → 换下一把 key（通常换到
+  // wb2api 就有），**不**计入 key 失败：key 没坏，只是没有该模型的权限/映射。
+  if (errorType === 'ModelUnavailable') {
+    logger.warn({ requestId: ctx.requestId, keyLabel: key.label, status: response.status,
+      body: errorBody.slice(0, 160) }, 'model not served by this provider — trying another key');
+    return { kind: 'retry', lastError: new Error(`model unavailable on ${key.label}`) };
+  }
+
   if (errorType === 'RequestFault') {
     // Client error — don't retry, don't penalise the key
     completeRequest(ctx.state, ctx.requestId, false);
