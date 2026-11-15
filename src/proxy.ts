@@ -630,7 +630,9 @@ async function executeWithRetry(opts: {
     kind: opts.kind,
     modelId: opts.modelId,
     onSuccess: opts.onSuccess,
-    sameKeyRetryBudget: 1,
+    // [dsh-patch same-key-retry] 额外重试次数（默认 2 = 最多 3 次尝试）。
+    // 只有一把可用 key 时，单次瞬时 reset 会直接冒成 503，必须多给几次机会。
+    sameKeyRetryBudget: Number(process.env.SAME_KEY_RETRY_ATTEMPTS ?? 0) || 2,
   };
 
   let lastError: Error | null = null;
@@ -839,33 +841,42 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     // [dsh-patch same-key-retry] 网络类失败（且不是 Connect Timeout —— 那说明路径断了）时，
     // 先用 10s 短超时对同一把 key 再试一次：瞬时 ECONNRESET / other side closed 常能一次救回，
     // 且失败发生在收到首字节前，不会重复计费。仍失败再走代理兜底 → failover。
-    if (isRetryableSameKey(err) && (ctx.sameKeyRetryBudget ?? 0) > 0) {
+    // 超时按体积自适应（与代理兜底同一套公式）：固定 10s 会输在 1MB+ 的 body 上
+    // （实测 78 次同 key 重试超时，救回的请求 p50 就有 1054KB）。
+    const retryBase = Number(process.env.SAME_KEY_RETRY_TIMEOUT_MS ?? 0) || 10_000;
+    const retryBytesPerSec = Number(process.env.SAME_KEY_RETRY_BYTES_PER_SEC
+      ?? process.env.PROXY_FALLBACK_BYTES_PER_SEC ?? 0) || 40_000;
+    const retryTimeoutMax = Number(process.env.SAME_KEY_RETRY_TIMEOUT_MAX_MS
+      ?? process.env.PROXY_FALLBACK_TIMEOUT_MAX_MS ?? 0) || 45_000;
+    const retryTimeout = Math.min(
+      retryTimeoutMax,
+      Math.round(retryBase + (ctx.bodyText.length / retryBytesPerSec) * 1000),
+    );
+    // [dsh-patch same-key-retry] 退避：立即重试常命中同一批坏连接（实测救不回来），
+    // 等几百毫秒让 undici 换新 socket 才有效；之后指数退避。
+    let retryDelay = Number(process.env.SAME_KEY_RETRY_DELAY_MS ?? 0) || 400;
+    while (isRetryableSameKey(err) && (ctx.sameKeyRetryBudget ?? 0) > 0) {
       ctx.sameKeyRetryBudget = (ctx.sameKeyRetryBudget ?? 1) - 1;
-      // 超时按体积自适应（与代理兜底同一套公式）：固定 10s 会输在 1MB+ 的 body 上
-      // （实测 78 次同 key 重试超时，救回的请求 p50 就有 1054KB）。
-      const retryBase = Number(process.env.SAME_KEY_RETRY_TIMEOUT_MS ?? 0) || 10_000;
-      const retryBytesPerSec = Number(process.env.SAME_KEY_RETRY_BYTES_PER_SEC
-        ?? process.env.PROXY_FALLBACK_BYTES_PER_SEC ?? 0) || 40_000;
-      const retryTimeoutMax = Number(process.env.SAME_KEY_RETRY_TIMEOUT_MAX_MS
-        ?? process.env.PROXY_FALLBACK_TIMEOUT_MAX_MS ?? 0) || 45_000;
-      const retryTimeout = Math.min(
-        retryTimeoutMax,
-        Math.round(retryBase + (ctx.bodyText.length / retryBytesPerSec) * 1000),
-      );
+      await new Promise((r) => setTimeout(r, retryDelay));
+      retryDelay = Math.min(4_000, retryDelay * 2);
       try {
         const retried = await fetchWithTimeout(upstreamUrl, fetchOptions, retryTimeout);
         if (retried.ok) {
           logger.info({ requestId: ctx.requestId, keyLabel: key.label, provider: provider.id,
-            timeoutMs: retryTimeout, bodyBytes: ctx.bodyText.length }, 'same-key retry succeeded');
+            timeoutMs: retryTimeout, bodyBytes: ctx.bodyText.length,
+            remaining: ctx.sameKeyRetryBudget }, 'same-key retry succeeded');
           markKeySucceeded(ctx.state, key.label);
           completeRequest(ctx.state, ctx.requestId, true);
           return { kind: 'done', response: await ctx.onSuccess(retried, ctx.state, ctx.requestId, key.label) };
         }
-        logger.warn({ requestId: ctx.requestId, keyLabel: key.label, status: retried.status },
-          'same-key retry got non-ok');
+        logger.warn({ requestId: ctx.requestId, keyLabel: key.label, status: retried.status,
+          remaining: ctx.sameKeyRetryBudget }, 'same-key retry got non-ok');
+        break; // 上游给了明确 HTTP 状态码 → 不是瞬时网络问题，别重试了
       } catch (retryErr) {
+        err = retryErr; // 用新错误继续判断下一轮
         logger.warn({ requestId: ctx.requestId, keyLabel: key.label,
           timeoutMs: retryTimeout, bodyBytes: ctx.bodyText.length,
+          remaining: ctx.sameKeyRetryBudget,
           err: String((retryErr as Error)?.message ?? retryErr).slice(0, 120) }, 'same-key retry failed');
       }
     }
