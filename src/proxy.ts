@@ -637,7 +637,11 @@ async function buildAttemptRequest(
     const warmed = catalogWarmCache.get(provider.id);
     if (!warmed || Date.now() - warmed > 300_000) {
       catalogWarmCache.set(provider.id, Date.now());
-      void provider.fetchCatalog(8000).catch(() => undefined);
+      try {
+        // 阻塞一次（≈0.2–1s，之后 5 分钟复用）：否则本次请求会把裸名发给 cc，
+        // 上游回 400「Model ... is not supported on this endpoint」。
+        await provider.fetchCatalog(8000);
+      } catch { /* 拉不到就按原始 id 发，上游会回 400，下次再试 */ }
     }
   }
   // [dsh-patch wb2api-bridge] workbuddy 的 /v1/models 需要鉴权，provider 级
