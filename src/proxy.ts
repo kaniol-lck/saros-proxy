@@ -39,7 +39,7 @@ import { getModelsList } from './models-fetcher.js';
 import { maybeRefreshUsage } from './usage-client.js';
 import { recordModelRequest } from './model-stats.js';
 import { recordKeyTokens } from './token-usage.js';
-import { getProvider, inferProvider } from './providers/index.js';
+import { getProvider, inferProvider, primeWorkbuddyCatalog, rememberWorkbuddyKey } from './providers/index.js';
 import type { KeyProvider, ProviderId } from './providers/index.js';
 
 /** Canonical client-facing chat route prefix (the opencode-go shape). */
@@ -681,7 +681,12 @@ async function buildAttemptRequest(
           { headers: { authorization: "Bearer " + key.key, accept: "application/json" } }, 8000);
         if (r.ok) {
           const j = (await r.json()) as { data?: Array<{ id: string }> };
-          wbModelCache.set("ids", { at: Date.now(), ids: (j.data ?? []).map((m: { id: string }) => String(m.id)) });
+          const ids = (j.data ?? []).map((m: { id: string }) => String(m.id));
+          wbModelCache.set("ids", { at: Date.now(), ids });
+          // [dsh-patch wb2api-catalog] 同步灌进 provider：亲和性与 resolveNativeId 依赖它，
+          // 而本部署的额度采集走独立进程，主进程收不到 key，只能从这里喂。
+          rememberWorkbuddyKey(key.key);
+          primeWorkbuddyCatalog(ids);
         }
       } catch { /* 缓存失败则保持裸名，wb2api 自己也会拒 */ }
     }

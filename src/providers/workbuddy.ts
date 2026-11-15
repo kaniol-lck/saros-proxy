@@ -30,6 +30,21 @@ let catalogCache: { at: number; ids: string[] } | null = null;
  */
 let apiKeyCache: string | null = null;
 
+/**
+ * [dsh-patch wb2api-catalog] 由 proxy 在成功用 key 拉到目录后回调，
+ * 直接灌入本地缓存 —— 不再依赖 queryUsage 的调用时机（本部署的额度采集
+ * 走独立进程，主进程收不到 key）。
+ */
+export function primeWorkbuddyCatalog(ids: string[]): void {
+  if (!ids || ids.length === 0) return;
+  catalogCache = { at: Date.now(), ids };
+}
+
+/** 记住 api_key，供后续带鉴权的目录拉取使用。 */
+export function rememberWorkbuddyKey(key: string): void {
+  if (key) apiKeyCache = key;
+}
+
 async function catalogIds(timeoutMs: number): Promise<string[]> {
   if (catalogCache && Date.now() - catalogCache.at < 300_000) return catalogCache.ids;
   try {
