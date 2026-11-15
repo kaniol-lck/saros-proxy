@@ -612,7 +612,11 @@ export function classifyHttpError(status: number, _body?: string): ErrorType {
   // DSH 再把它显示成「API 密钥无效」（已实测踩过）。
   if (status === 403 && _body && /MODEL_NOT_IN_PLAN/i.test(_body)) return 'ModelUnavailable';
   if (status === 400 && _body && /is not supported on this endpoint/i.test(_body)) return 'ModelUnavailable';
-  if ((status === 400 || status === 503) && _body && /model_unavailable|model_blocked/i.test(_body)) {
+  // [dsh-patch model-affinity] wb2api 的 503 no_healthy_account 是"该模型在它账号池里
+  // 全在冷却"，属模型级不可用；若当 ServerFault 会连击 3 次把整把 key 关掉，
+  // 之后所有 wb2api 模型都 503（实测一次 sweep 后半段整片失败）。
+  if ((status === 400 || status === 503)
+      && _body && /model_unavailable|model_blocked|no_healthy_account/i.test(_body)) {
     return 'ModelUnavailable';
   }
   if (status === 400 || status === 403 || status === 404 || status === 422) return 'RequestFault';
