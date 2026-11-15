@@ -982,6 +982,23 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
  * 其它 provider（如 opencode-go）没有原生 id 改写，一律放行——它们的 catalog 可能
  * 还没加载，用 affinity 'no' 否决会误伤正常的 failover。
  */
+/**
+ * [dsh-patch affinity-first-pick] provider 是否服务不了这个模型（用于首次选点时避坑）。
+ *
+ * 只对 commandcode 生效：它是唯一"必须把裸名改写成原生 id、否则上游必 400"的
+ * provider（hy3 → 只有 tencent/hy3-paid，裸名直接被拒）。其它 provider 的
+ * modelAffinity 对目录外模型也会答 'no'，若一并否决会打乱正常轮换
+ * （实测会把 14 个 account-switching / e2e 轮换测试打崩）。
+ *
+ * 判定复用 providerCanServe：它内部就是"cc 且 resolveNativeId 为 null → 不能服务"。
+ */
+function providerRejectsModel(provider: KeyProvider, modelId: string | undefined): boolean {
+  if (!provider || !modelId) return false;
+  if (parseProviderSuffix(modelId)) return false; // 显式 pin 的请求尊重调用方
+  if (provider.id !== 'commandcode') return false;
+  return !providerCanServe(provider, modelId);
+}
+
 function providerCanServe(provider: KeyProvider, modelId: string | undefined): boolean {
   if (!provider || !modelId) return true;
   if (provider.modelAffinity(modelId) === 'yes') return true;
@@ -998,7 +1015,23 @@ function providerCanServe(provider: KeyProvider, modelId: string | undefined): b
 }
 
 function pickKey(ctx: RetryContext, attempt: number): KeySnapshot | null {
-  if (attempt === 0) return selectKeyForRequest(ctx.state, ctx.requestId, ctx.modelId);
+  if (attempt === 0) {
+    const first = selectKeyForRequest(ctx.state, ctx.requestId, ctx.modelId);
+    if (!first) return null;
+    // [dsh-patch affinity-first-pick] 首选 provider 明确服务不了该模型时，
+    // 换一个不否决的 key（否则会把裸名发给 cc，换来 400 not supported）。
+    if (!providerRejectsModel(providerForKey(first, ctx.config, ctx.modelId), ctx.modelId)) {
+      return first;
+    }
+    for (let i = 0; i < 8; i++) {
+      const next = failoverRequest(ctx.state, ctx.requestId);
+      if (!next) break;
+      if (!providerRejectsModel(providerForKey(next, ctx.config, ctx.modelId), ctx.modelId)) {
+        return next;
+      }
+    }
+    return first; // 都否决了就按原逻辑用首选，保持旧行为
+  }
   // [dsh-patch failover-affinity] 逐个取候选，跳过"该 provider 服务不了此 model"的 key，
   // 避免把裸 id 发到 commandcode 换来 400（RequestFault 不会重试，直接透传给客户端）。
   for (let i = 0; i < 8; i++) {
