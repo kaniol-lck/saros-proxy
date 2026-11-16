@@ -56,6 +56,8 @@ export interface KeySnapshot {
 interface RequestContext {
   requestId: string;
   triedKeys: string[]; // keys already attempted for this request (for failover)
+  /** [dsh-patch stale-sweep] 上下文创建时刻，用于清扫僵尸请求。 */
+  createdAt?: number;
   currentKey: KeySnapshot | null; // the key currently in use by this request
   /**
    * Provider filter fixed at selection time (model affinity / @suffix pin).
@@ -423,7 +425,8 @@ export function selectKeyForRequest(
   }
 
   // Create new context and pick a fresh key
-  const ctx: RequestContext = { requestId, triedKeys: [], currentKey: null };
+  sweepStaleRequests(state);
+  const ctx: RequestContext = { requestId, triedKeys: [], currentKey: null, createdAt: Date.now() };
   state.activeRequests.set(requestId, ctx);
 
   const providerFilter = makeProviderFilter(state, modelId);
@@ -469,6 +472,27 @@ export function selectKeyForRequest(
 }
 
 /**
+ * [dsh-patch stale-sweep] 清掉超龄的请求上下文。
+ *
+ * 只要有一次没走到 completeRequest（例如卡在等上游响应头），
+ * activeRequests 就会永久 +1，并且那把 key 一直被 buildBookedLabels 当成"占用"。
+ * 实测堆到 17 个，直接把选点逼进"共享 key"档位。这里在每次选点时顺手清理。
+ */
+export function sweepStaleRequests(state: ProxyState, maxAgeMs?: number): number {
+  const limit = maxAgeMs ?? (Number(process.env.STALE_REQUEST_MAX_AGE_MS ?? 0) || 600_000);
+  const now = Date.now();
+  let removed = 0;
+  for (const [rid, ctx] of state.activeRequests) {
+    const born = ctx.createdAt ?? 0;
+    if (born > 0 && now - born > limit) {
+      state.activeRequests.delete(rid);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+/**
  * [dsh-patch session-sticky] 按 label 精确取一把 key（会话粘性用）。
  *
  * 与 selectKeyForRequest 的区别：不参与加权轮转，直接锁定指定 key。
@@ -487,7 +511,7 @@ export function selectKeyByLabel(
   if (!key || !isKeyAvailable(state, key)) return null;
 
   const snapshot = toSnapshot(key);
-  const ctx: RequestContext = { requestId, triedKeys: [], currentKey: snapshot };
+  const ctx: RequestContext = { requestId, triedKeys: [], currentKey: snapshot, createdAt: Date.now() };
   state.activeRequests.set(requestId, ctx);
   return snapshot;
 }

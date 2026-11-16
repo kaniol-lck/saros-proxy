@@ -639,6 +639,8 @@ interface RetryContext {
   primaryProxyUrl?: string;
   /** [dsh-patch session-sticky] 本请求所属会话标识（惰性计算并缓存，undefined=未算）。 */
   conversationKey?: string | null;
+  /** [dsh-patch request-deadline] 整个请求（含所有重试）的绝对截止时刻。 */
+  deadlineAt?: number;
 }
 
 type AttemptResult =
@@ -679,9 +681,21 @@ async function executeWithRetry(opts: {
     sameKeyRetryBudget: Number(process.env.SAME_KEY_RETRY_ATTEMPTS ?? 0) || 2,
   };
 
+  // [dsh-patch request-deadline] 整个请求的硬期限。
+  // 没有它时，MAX_RETRIES × 单次超时（最大 240s）会叠成十几分钟，
+  // 客户端只看到「一直转圈」（实测有请求挂 26 分钟仍未结束）。
+  const deadlineMs = Number(process.env.REQUEST_DEADLINE_MS ?? 0) || 300_000;
+  ctx.deadlineAt = Date.now() + deadlineMs;
+
   let lastError: Error | null = null;
 
   for (let attempt = 0; attempt < opts.maxRetries; attempt++) {
+    if (Date.now() >= ctx.deadlineAt) {
+      logger.warn({ requestId: ctx.requestId, attempt, deadlineMs },
+        'request deadline exceeded — stop retrying');
+      lastError = new Error('request deadline exceeded');
+      break;
+    }
     const result = await executeSingleAttempt(attempt, ctx);
     if (result.kind === 'done') return result.response;
     lastError = result.lastError;
@@ -1418,10 +1432,19 @@ function logUpstreamError(
  */
 function attemptTimeoutMs(ctx: RetryContext): number {
   const base = ctx.config.requestTimeoutMs;
-  if (ctx.kind !== 'streaming') return base;
-  const bytesPerSec = Number(process.env.STREAM_TIMEOUT_BYTES_PER_SEC ?? 0) || 40_000;
   const cap = Number(process.env.STREAM_TIMEOUT_MAX_MS ?? 0) || 120_000;
-  return Math.min(cap, Math.round(base + (ctx.bodyText.length / bytesPerSec) * 1000));
+  const bytesPerSec = Number(process.env.STREAM_TIMEOUT_BYTES_PER_SEC ?? 0) || 40_000;
+  const raw = ctx.kind !== 'streaming'
+    ? base
+    : Math.min(cap, Math.round(base + (ctx.bodyText.length / bytesPerSec) * 1000));
+  // [dsh-patch request-deadline] 单次尝试不得超过整个请求的剩余时间，
+  // 否则最后一次重试会把总时长顶穿期限（实测可到 10 分钟以上）。
+  if (ctx.deadlineAt) {
+    const remaining = ctx.deadlineAt - Date.now();
+    if (remaining <= 0) return 1;
+    return Math.min(raw, remaining);
+  }
+  return raw;
 }
 
 function logTimeout(requestId: string, key: KeySnapshot, timeoutMs: number, kind: RequestKind): void {
@@ -1549,6 +1572,9 @@ async function handleStreamingRequest(opts: HandleRequestOptions): Promise<Respo
  * If an error marker is detected mid-stream, the failed key is penalised,
  * a proxy_error SSE event is sent to the client, and the stream is closed.
  */
+/** [dsh-patch stream-idle-timeout] 仅用于区分"空闲超时"与真正的读错误。 */
+class StreamIdleTimeoutError extends Error {}
+
 function wrapStreamWithErrorDetection(
   upstreamStream: ReadableStream<Uint8Array>,
   state: ProxyState,
@@ -1599,7 +1625,42 @@ function wrapStreamWithErrorDetection(
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
-        const { done, value } = await reader.read();
+        // [dsh-patch stream-idle-timeout] 读 body 期间的空闲超时。
+        // fetchWithTimeout 的定时器在收到响应头时就清了，此后如果上游断流
+        // （发完 headers 不再吐数据），reader.read() 会永远挂起 ——
+        // 客户端表现为「一直转圈」，且 completeRequest 永不执行（上下文泄漏）。
+        const idleMs = Number(process.env.STREAM_IDLE_TIMEOUT_MS ?? 0) || 120_000;
+        let idleTimer: ReturnType<typeof setTimeout> | null = null;
+        const idleGuard = new Promise<never>((_, reject) => {
+          idleTimer = setTimeout(
+            () => reject(new StreamIdleTimeoutError('stream idle timeout after ' + idleMs + 'ms')),
+            idleMs,
+          );
+        });
+        let readResult: ReadableStreamReadResult<Uint8Array>;
+        try {
+          readResult = await Promise.race([reader.read(), idleGuard]);
+        } catch (idleErr) {
+          if (idleTimer) clearTimeout(idleTimer);
+          // 只有空闲超时才在这里处理；真正的读错误交给外层 catch（保留原语义：
+          // 记录 'Stream read error' 并下发 'Stream interrupted'）。
+          if (!(idleErr instanceof StreamIdleTimeoutError)) throw idleErr;
+          logger.warn({ requestId, keyLabel, idleMs }, 'stream idle timeout — aborting upstream read');
+          markKeyFailed(state, keyLabel, 'ServerFault');
+          bookUsage();
+          void reader.cancel().catch(() => undefined);
+          enqueueStream(
+            controller,
+            encoder.encode(
+              'data: {"type":"proxy_error","message":"Upstream stream stalled"}\n\n',
+            ),
+          );
+          closeStream(controller);
+          return;
+        } finally {
+          if (idleTimer) clearTimeout(idleTimer);
+        }
+        const { done, value } = readResult;
 
         if (done) {
           bookUsage();
