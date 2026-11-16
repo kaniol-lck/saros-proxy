@@ -1616,6 +1616,8 @@ function wrapStreamWithErrorDetection(
   // pull 与 catch 两路可能都去 close()，Node 会抛
   // TypeError: Invalid state: Controller is already closed（近 20 分钟 76 次）。
   let streamClosed = false;
+  /** [dsh-patch sse-boundary] 已转发数据的尾部换行数（0/1/2），用于补齐事件边界。 */
+  let trailingNewlines = 0;
   const closeStream = (controller: ReadableStreamDefaultController<Uint8Array>): void => {
     if (streamClosed) return;
     streamClosed = true;
@@ -1626,7 +1628,36 @@ function wrapStreamWithErrorDetection(
     chunk: Uint8Array,
   ): void => {
     if (streamClosed) return;
-    try { controller.enqueue(chunk); } catch { streamClosed = true; }
+    try {
+      controller.enqueue(chunk);
+      // [dsh-patch sse-boundary] 记录尾部换行数，用于判断是否落在事件边界上。
+      // SSE 事件以空行（\n\n）分隔；若上游分片停在半个事件里，
+      // 直接追加合成事件会把两段 JSON 粘成一行 → 客户端 JSON.parse 失败
+      // （实测 DSH 报 "malformed server-sent event JSON"）。
+      let n = 0;
+      for (let i = chunk.length - 1; i >= 0 && chunk[i] === 0x0a && n < 2; i--) n++;
+      if (n === 2) trailingNewlines = 2;
+      else if (n === 1) trailingNewlines = Math.min(2, trailingNewlines + 1);
+      else trailingNewlines = 0;
+    } catch { streamClosed = true; }
+  };
+
+  /**
+   * [dsh-patch sse-boundary] 写入合成的 SSE 事件前，先把边界补齐。
+   * 返回 false 表示流已关闭。
+   */
+  const enqueueSyntheticEvent = (
+    controller: ReadableStreamDefaultController<Uint8Array>,
+    payload: string,
+  ): void => {
+    if (streamClosed) return;
+    // 补足到空行边界，确保合成事件是一个独立事件
+    if (trailingNewlines < 2) {
+      const pad = trailingNewlines === 0 ? '\n\n' : '\n';
+      enqueueStream(controller, encoder.encode(pad));
+      if (streamClosed) return;
+    }
+    enqueueStream(controller, encoder.encode(payload));
   };
 
   return new ReadableStream<Uint8Array>({
@@ -1656,11 +1687,9 @@ function wrapStreamWithErrorDetection(
           markKeyFailed(state, keyLabel, 'ServerFault');
           bookUsage();
           void reader.cancel().catch(() => undefined);
-          enqueueStream(
+          enqueueSyntheticEvent(
             controller,
-            encoder.encode(
-              'data: {"type":"proxy_error","message":"Upstream stream stalled"}\n\n',
-            ),
+            'data: {"type":"proxy_error","message":"Upstream stream stalled"}\n\n',
           );
           closeStream(controller);
           return;
@@ -1703,11 +1732,9 @@ function wrapStreamWithErrorDetection(
               }
               // Whatever the upstream reported before failing was consumed.
               bookUsage();
-              enqueueStream(
+              enqueueSyntheticEvent(
                 controller,
-                encoder.encode(
-                  'data: {"type":"proxy_error","message":"Upstream stream error"}\n\n',
-                ),
+                'data: {"type":"proxy_error","message":"Upstream stream error"}\n\n',
               );
               closeStream(controller);
               return;
@@ -1731,11 +1758,9 @@ function wrapStreamWithErrorDetection(
         logger.error({ requestId, keyLabel, err }, 'Stream read error');
         markKeyFailed(state, keyLabel, 'ServerFault');
         bookUsage();
-        enqueueStream(
+        enqueueSyntheticEvent(
           controller,
-          encoder.encode(
-            'data: {"type":"proxy_error","message":"Stream interrupted"}\n\n',
-          ),
+          'data: {"type":"proxy_error","message":"Stream interrupted"}\n\n',
         );
         closeStream(controller);
       }
