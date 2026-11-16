@@ -1016,7 +1016,16 @@ function providerCanServe(provider: KeyProvider, modelId: string | undefined): b
 
 function pickKey(ctx: RetryContext, attempt: number): KeySnapshot | null {
   if (attempt === 0) {
-    const first = selectKeyForRequest(ctx.state, ctx.requestId, ctx.modelId);
+    // [dsh-patch big-body-prefer-local] 大 body 优先本地 wb2api：
+    // cc 对 ~1MB 的请求会 UND_ERR_SOCKET（实测 2/2 失败），wb2api 稳过。
+    const bigBodyLimit = Number(process.env.BIG_BODY_PREFER_LOCAL_BYTES ?? 0) || 512 * 1024;
+    let preferProvider: string | undefined;
+    if (ctx.bodyText.length >= bigBodyLimit && ctx.modelId) {
+      const wbProvider = getProvider('workbuddy' as ProviderId);
+      // 只有 wb2api 确实能服务这个模型时才优先（否则白跑一趟）
+      if (wbProvider && wbProvider.modelAffinity(ctx.modelId) !== 'no') preferProvider = 'workbuddy';
+    }
+    const first = selectKeyForRequest(ctx.state, ctx.requestId, ctx.modelId, preferProvider);
     if (!first) return null;
     // [dsh-patch affinity-first-pick] 首选 provider 明确服务不了该模型时，
     // 换一个不否决的 key（否则会把裸名发给 cc，换来 400 not supported）。

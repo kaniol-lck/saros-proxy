@@ -409,6 +409,12 @@ export function selectKeyForRequest(
   state: ProxyState,
   requestId: string,
   modelId?: string,
+  /**
+   * [dsh-patch big-body-prefer-local] 指定优先 provider（如 'workbuddy'）。
+   * 大 body 走本地网关更稳：实测 cc 对 1.1MB 直接 UND_ERR_SOCKET，wb2api 200。
+   * 该 provider 没有可用 key 时，自动落回原有分档逻辑。
+   */
+  preferProvider?: string,
 ): KeySnapshot | null {
   // If context already exists, return the already-assigned current key
   const existing = state.activeRequests.get(requestId);
@@ -429,6 +435,17 @@ export function selectKeyForRequest(
   const booked = buildBookedLabels(state);
   for (const label of booked) {
     excludeLabels.add(label);
+  }
+
+  // [dsh-patch big-body-prefer-local] 先试指定 provider（大 body 优先本地网关）
+  if (preferProvider) {
+    const preferFilter = (p: string): boolean => p === preferProvider;
+    let preferred = findNextKey(state, excludeLabels, preferFilter);
+    if (!preferred) preferred = findNextKey(state, new Set(ctx.triedKeys), preferFilter);
+    if (preferred) {
+      ctx.currentKey = preferred;
+      return preferred;
+    }
   }
 
   let snapshot = findNextKey(state, excludeLabels, providerFilter);
