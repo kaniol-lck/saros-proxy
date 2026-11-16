@@ -1308,7 +1308,7 @@ function logKeyAttempt(requestId: string, key: KeySnapshot, attempt: number, kin
  * [dsh-patch req-tokens] 从上游 `usage` 对象里取 token 计数（OpenAI 形状与
  * Anthropic 形状都兼容），供面板按小时聚合 token 用量。
  */
-function tokenCounts(usage: unknown): { tokIn: number; tokOut: number } | null {
+function tokenCounts(usage: unknown): { tokIn: number; tokOut: number; cached: number } | null {
   if (!usage || typeof usage !== 'object' || Array.isArray(usage)) return null;
   const record = usage as Record<string, unknown>;
   const pick = (a: string, b: string): number | null => {
@@ -1318,7 +1318,22 @@ function tokenCounts(usage: unknown): { tokIn: number; tokOut: number } | null {
   const tokIn = pick('prompt_tokens', 'input_tokens');
   const tokOut = pick('completion_tokens', 'output_tokens');
   if (tokIn === null && tokOut === null) return null;
-  return { tokIn: tokIn ?? 0, tokOut: tokOut ?? 0 };
+  // [dsh-patch cache-observability] 上游的 prompt cache 命中量。
+  // OpenAI/cc 走 prompt_tokens_details.cached_tokens；部分网关用别的键。
+  // -1 表示"未上报"（区别于 0 = 确实没命中），便于统计时区分。
+  const details = record.prompt_tokens_details ?? record.input_tokens_details;
+  let cached = -1;
+  if (details && typeof details === 'object' && !Array.isArray(details)) {
+    const c = (details as Record<string, unknown>).cached_tokens;
+    if (typeof c === 'number' && Number.isFinite(c)) cached = c;
+  }
+  if (cached < 0) {
+    for (const k of ['cached_tokens', 'prompt_cache_hit_tokens', 'cache_read_input_tokens']) {
+      const v = record[k];
+      if (typeof v === 'number' && Number.isFinite(v)) { cached = v; break; }
+    }
+  }
+  return { tokIn: tokIn ?? 0, tokOut: tokOut ?? 0, cached };
 }
 
 function logUpstreamError(
@@ -1393,7 +1408,7 @@ const standardSuccessHandler: SuccessHandler = async (response, state, requestId
   recordKeyTokens(keyLabel, usage);
   // [dsh-patch req-tokens] 逐请求 token 进日志（面板按小时聚合）
   const counts = tokenCounts(usage);
-  if (counts) logger.info({ requestId, keyLabel, tokIn: counts.tokIn, tokOut: counts.tokOut }, 'request tokens');
+  if (counts) logger.info({ requestId, keyLabel, tokIn: counts.tokIn, tokOut: counts.tokOut, cached: counts.cached }, 'request tokens');
   const downstreamHeaders = buildDownstreamHeaders(response.headers);
   downstreamHeaders.set('X-Proxy-Key-Label', keyLabel);
   downstreamHeaders.set('X-Proxy-Request-Id', requestId);
@@ -1509,7 +1524,7 @@ function wrapStreamWithErrorDetection(
     recordKeyTokens(keyLabel, usage);
     // [dsh-patch req-tokens] 流式请求在结束时把 token 记进日志
     const counts = tokenCounts(usage);
-    if (counts) logger.info({ requestId, keyLabel, tokIn: counts.tokIn, tokOut: counts.tokOut }, 'request tokens');
+    if (counts) logger.info({ requestId, keyLabel, tokIn: counts.tokIn, tokOut: counts.tokOut, cached: counts.cached }, 'request tokens');
   };
 
   // [dsh-patch stream-double-close] 客户端提前断开 / 上游刚结束时，
