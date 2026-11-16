@@ -48,6 +48,43 @@ const CANONICAL_CHAT_BASE = '/zen/go/v1';
 // [dsh-patch wb2api-bridge] workbuddy 的模型目录缓存（/v1/models 需要鉴权）
 const wbModelCache = new Map<string, { at: number; ids: string[] }>();
 
+/**
+ * [dsh-patch wb-realm-evidence] 每个裸名"最近一次成功的 realm"。
+ *
+ * 铁律 0：realm 的可用性是**状态**，不是契约。之前把「永远 global 优先」
+ * 写死在改写链里，结果 2026-11-17 01:36 global 池对该模型连续 11 次
+ * no_healthy_account，而 cn 一次就 200 —— 固定链只会傻等 failover。
+ * 现在只记"证据"并带 TTL，过期即回到默认顺序。
+ */
+const wbRealmEvidence = new Map<string, { realm: 'global' | 'cn'; at: number }>();
+
+function wbRealmTtlMs(): number {
+  return Number(process.env.WB_REALM_EVIDENCE_TTL_MS ?? 0) || 600_000;
+}
+
+function noteWbRealm(bare: string, target: string | undefined): void {
+  if (!bare || !target) return;
+  const realm = target.startsWith('cn:') ? 'cn' : target.startsWith('global:') ? 'global' : null;
+  if (!realm) return;
+  wbRealmEvidence.set(bare.toLowerCase(), { realm, at: Date.now() });
+  if (wbRealmEvidence.size > 2000) {
+    const ttl = wbRealmTtlMs();
+    const now = Date.now();
+    for (const [k, v] of wbRealmEvidence) if (now - v.at > ttl) wbRealmEvidence.delete(k);
+  }
+}
+
+/** 证据里该裸名的首选 realm（过期则返回 null）。 */
+function preferredWbRealm(bare: string): 'global' | 'cn' | null {
+  const hit = wbRealmEvidence.get(bare.toLowerCase());
+  if (!hit) return null;
+  if (Date.now() - hit.at > wbRealmTtlMs()) {
+    wbRealmEvidence.delete(bare.toLowerCase());
+    return null;
+  }
+  return hit.realm;
+}
+
 // [dsh-patch catalog-warm] 每个 provider 的目录预热时间戳（5 分钟节流）
 const catalogWarmCache = new Map<string, number>();
 
@@ -641,6 +678,10 @@ interface RetryContext {
   conversationKey?: string | null;
   /** [dsh-patch request-deadline] 整个请求（含所有重试）的绝对截止时刻。 */
   deadlineAt?: number;
+  /** [dsh-patch wb-realm-evidence] 本请求锁定的 wb2api 改写目标（换 realm 重试用）。 */
+  workbuddyRealmPin?: string;
+  /** [dsh-patch wb-realm-evidence] 备选 realm 的改写目标（首选失败时立刻改投）。 */
+  workbuddyAltRewrite?: string;
 }
 
 type AttemptResult =
@@ -750,9 +791,6 @@ async function buildAttemptRequest(
     }
     const ids = wbModelCache.get("ids")?.ids ?? [];
     const bare = (ctx.modelId ?? "").toLowerCase();
-    // [wb2api-bridge] 优先级：global 精确 → cn 精确 → global 前缀 → cn 前缀。
-    // 两边都有的模型优先 global（cn 账号服务不了 deepseek 系，先试 cn 会白 503）；
-    // cn 独有模型（如 hy3-x）则用 cn，从而"并"进全部 wb2api 模型。
     const exact = (realm: string): string | undefined =>
       ids.find((id) => id.toLowerCase() === realm + ":" + bare);
     const prefixed = (realm: string): string | undefined =>
@@ -760,8 +798,27 @@ async function buildAttemptRequest(
         const low = id.toLowerCase();
         return low.startsWith(realm + ":") && low.slice(realm.length + 1).startsWith(bare);
       });
-    const target = exact("global") ?? exact("cn") ?? prefixed("global") ?? prefixed("cn");
-    if (target) ctx.workbuddyRewrite = target;
+    if (ctx.workbuddyRealmPin) {
+      // 上一轮命中 no_healthy_account，已指定改投另一个 realm
+      ctx.workbuddyRewrite = ctx.workbuddyRealmPin;
+    } else {
+      // [dsh-patch wb-realm-evidence] 顺序来自运行时证据，不是常量：
+      // 先在"最近成功过的 realm"里找，找不到再试另一个。两个都只是候选，
+      // 真正行不行由上游回答；首选失败时会立刻改投备选（见 handleUpstreamErrorResponse）。
+      const evidence = preferredWbRealm(bare);
+      const order: Array<'global' | 'cn'> = evidence === 'cn' ? ['cn', 'global'] : ['global', 'cn'];
+      const candidates: string[] = [];
+      for (const realm of order) {
+        const hit = exact(realm) ?? prefixed(realm);
+        if (hit && !candidates.includes(hit)) candidates.push(hit);
+      }
+      if (candidates.length > 0) {
+        ctx.workbuddyRewrite = candidates[0];
+        ctx.workbuddyAltRewrite = candidates[1];
+      }
+      logger.info({ requestId: ctx.requestId, bare, evidence,
+        candidates }, 'wb2 realm candidates (evidence-first)');
+    }
   }
   const upstreamUrl = resolveUpstreamUrl(ctx.config, provider, ctx.path);
   const sessionHeader = provider.sessionHeader;
@@ -942,6 +999,12 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     if (response.ok) {
       markKeySucceeded(ctx.state, effectiveKey.label);
       noteStickyKey(ctx, effectiveKey.label);
+      // [dsh-patch wb-realm-evidence] 记下这次成功的 realm，供下次首选
+      if (providerForKey(effectiveKey, ctx.config, ctx.modelId).id === 'workbuddy') {
+        noteWbRealm((ctx.modelId ?? '').toLowerCase(), ctx.workbuddyRewrite);
+        ctx.workbuddyRealmPin = undefined;
+        ctx.workbuddyAltRewrite = undefined;
+      }
       completeRequest(ctx.state, ctx.requestId, true);
       const downstream = await ctx.onSuccess(response, ctx.state, ctx.requestId, key.label);
       logger.info(
@@ -1261,6 +1324,26 @@ async function handleUpstreamErrorResponse(
   const errorType = classifyHttpError(response.status, errorBody);
   logUpstreamError(ctx.requestId, key, response.status, errorType, errorBody, ctx.kind);
   captureFailedRequest(ctx, response.status, errorBody);
+
+  // [dsh-patch wb-realm-evidence] 同一条 wb2api 链路先换 realm 再谈"换家"。
+  // 实测 global 池对该模型无健康账号时 cn 就 200 —— 换 realm 才是当场正解，
+  // 等 failover 只会多绕一圈（期间还可能把别的 key 白撞一遍）。
+  if (errorType === 'ModelUnavailable' && ctx.workbuddyAltRewrite
+      && providerForKey(key, ctx.config, ctx.modelId).id === 'workbuddy') {
+    const next = ctx.workbuddyAltRewrite;
+    ctx.workbuddyRealmPin = next;
+    ctx.workbuddyAltRewrite = undefined;
+    // 记下"这个 realm 不行"，下次优先另一个（带 TTL，不做永久结论）
+    const bare = (ctx.modelId ?? '').toLowerCase();
+    if (bare) {
+      const bad = /^cn:/.test(ctx.workbuddyRewrite ?? '') ? 'global' : 'cn';
+      wbRealmEvidence.set(bare, { realm: bad, at: Date.now() });
+    }
+    logger.warn({ requestId: ctx.requestId, keyLabel: key.label, status: response.status,
+      from: ctx.workbuddyRewrite, to: next },
+      'wb2 realm unavailable — switching realm on same key');
+    return { kind: 'retry', lastError: new Error(`wb2 realm switch → ${next}`) };
+  }
 
   // [dsh-patch model-affinity] 这家服务不了这个模型 → 换下一把 key（通常换到
   // wb2api 就有），**不**计入 key 失败：key 没坏，只是没有该模型的权限/映射。
