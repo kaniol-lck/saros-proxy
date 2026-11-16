@@ -883,19 +883,26 @@ async function fetchWithHedge(
   };
 
   const first = await Promise.race([primary, hedge]);
-  if (timer) clearTimeout(timer);
 
   // [dsh-patch hedge-prefer-ok] 关键：先到的不一定是好结果。
   // wb2api 的 no_healthy_account 几乎 0ms 返回 503，若让它"赢"就会把
   // 本来能成功的 cc（primary）abort 掉 —— 实测造成间歇性 503。
   if (first.kind === 'ok') {
+    if (timer) clearTimeout(timer);
     abortLoser(first.via);
     return { res: first.res, label: first.label };
   }
 
-  // 先到的是错误/异常：给另一方一次机会（它可能更慢但成功）
+  // 先到的是错误/异常：给另一方一次机会（它可能更慢但成功）。
+  // ⚠️ 这里**不能**先 clearTimeout：若 first 来自 primary，则 hedge 还没启动，
+  // 清掉定时器会让 hedge 永 not settle，await 永久挂起（实测泄漏 12 个上下文）。
   const other = first.via === 'primary' ? hedge : primary;
-  const second = await other;
+  let second: Settled;
+  try {
+    second = await other;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
   const winner = second.kind === 'ok' ? second : first;
   if (winner === first) abortLoser(first.via);
   else abortLoser(second.via);
