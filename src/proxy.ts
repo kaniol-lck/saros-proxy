@@ -1077,7 +1077,7 @@ function pickKey(ctx: RetryContext, attempt: number): KeySnapshot | null {
       if (sticky && Date.now() - sticky.at <= stickyTtlMs()) {
         const snap = selectKeyByLabel(ctx.state, ctx.requestId, sticky.label);
         if (snap && !providerRejectsModel(providerForKey(snap, ctx.config, ctx.modelId), ctx.modelId)) {
-          logger.debug({ requestId: ctx.requestId, conversation: convKey.slice(0, 12), keyLabel: sticky.label },
+          logger.info({ requestId: ctx.requestId, conversation: convKey.slice(0, 12), keyLabel: sticky.label },
             'session sticky hit');
           return snap;
         }
