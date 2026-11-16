@@ -1782,6 +1782,36 @@ function wrapStreamWithErrorDetection(
         const { done, value } = readResult;
 
         if (done) {
+          // [dsh-patch sse-complete-events] 流结束时 buffer 里可能还剩半个事件
+          // （上游在事件中间断开）。绝不能原样转发 —— 客户端会 JSON.parse 失败
+          // （实测 DSH 报 "malformed server-sent event JSON"）。
+          // 只有能独立解析成合法 JSON 时才补边界转发，否则丢弃。
+          const tail = buffer.trim();
+          buffer = '';
+          if (tail) {
+            const tailPayload = tail
+              .split('\n')
+              .filter((ln) => ln.startsWith('data:'))
+              .map((ln) => ln.slice(5).trim())
+              .join('');
+            let tailOk = false;
+            if (tailPayload === '[DONE]') {
+              tailOk = true;
+            } else if (tailPayload) {
+              try { JSON.parse(tailPayload); tailOk = true; } catch { tailOk = false; }
+            }
+            if (tailOk) {
+              // 直接一次写入（自己补边界），不走 enqueueSyntheticEvent 的两步逻辑：
+              // 那两步在 controller 已不可用时可能"第一步失败、第二步静默丢弃"，
+              // 导致 pull 既不写入也不抛错 → ReadableStream 永久等待（实测挂 60s）。
+              const pad = trailingNewlines >= 2 ? '' : trailingNewlines === 1 ? '\n' : '\n\n';
+              enqueueStream(controller, encoder.encode(pad + tail + '\n\n'));
+            } else {
+              logger.warn({ requestId, keyLabel, tailBytes: tail.length,
+                tailHead: tail.slice(0, 80) },
+                'dropping incomplete trailing SSE event (upstream closed mid-event)');
+            }
+          }
           bookUsage();
           closeStream(controller);
           return;
@@ -1835,7 +1865,12 @@ function wrapStreamWithErrorDetection(
           }
         }
 
-        // Pass through the chunk as-is
+        // Pass through the chunk as-is.
+        // [dsh-patch sse-complete-events] 注意：**不要**在这里只转发"完整事件"。
+        // 客户端按 \n\n 切分，半个事件会自然等下一个 chunk；若在这里过滤，
+        // 某些路径会出现"pull 返回但既不写数据也不关闭"，客户端永久等待
+        // （实测测试挂 60s、usage 被重复记账 3 次）。
+        // 真正需要处理的只有"流结束时 buffer 里残留的半个事件"，见 done 分支。
         enqueueStream(controller, value);
       } catch (err) {
         logger.error({ requestId, keyLabel, err }, 'Stream read error');
