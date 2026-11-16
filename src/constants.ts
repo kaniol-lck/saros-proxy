@@ -24,7 +24,7 @@ export const MAX_BODY_SIZE = Number(process.env.MAX_BODY_SIZE_BYTES) || 10 * 102
 // [dsh-patch retries] 三家 provider 池下 2 次不够：oc 月度耗尽时，
 // 只有 cc + wb2api 两个候选，若首个因"模型冷却"被换掉，第二次必须能落到另一家。
 // 默认 3（可被 MAX_RETRIES 覆盖）。
-export const MAX_RETRIES = Number(process.env.MAX_RETRIES) || 3;
+export const MAX_RETRIES = Number(process.env.MAX_RETRIES) || 2;
 export const RATE_LIMIT_WINDOW_MS = 60_000;
 // [dsh-patch] 单机多 agent 并发时 100/min 会误伤；生产用 RATE_LIMIT_MAX=600 覆盖。
 export const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX) || 100;
