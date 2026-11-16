@@ -469,6 +469,30 @@ export function selectKeyForRequest(
 }
 
 /**
+ * [dsh-patch session-sticky] 按 label 精确取一把 key（会话粘性用）。
+ *
+ * 与 selectKeyForRequest 的区别：不参与加权轮转，直接锁定指定 key。
+ * key 不可用时返回 null，并且**不**建立请求上下文（否则 selectKeyForRequest
+ * 会因为 ctx 已存在而返回 null）。
+ */
+export function selectKeyByLabel(
+  state: ProxyState,
+  requestId: string,
+  label: string,
+): KeySnapshot | null {
+  const existing = state.activeRequests.get(requestId);
+  if (existing) return existing.currentKey;
+
+  const key = state.keys.find((k) => k.label === label);
+  if (!key || !isKeyAvailable(state, key)) return null;
+
+  const snapshot = toSnapshot(key);
+  const ctx: RequestContext = { requestId, triedKeys: [], currentKey: snapshot };
+  state.activeRequests.set(requestId, ctx);
+  return snapshot;
+}
+
+/**
  * Failover: record the current key of this request as failed and pick the next
  * available key.  The caller should also call markKeyFailed() with the
  * appropriate ErrorType; this function only manages the request-context

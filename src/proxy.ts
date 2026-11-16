@@ -26,7 +26,7 @@ import {
   type KeySnapshot,
   peekAlternativeKeys,
   setKeyQuotaOut,
-} from './proxy-logic.js';
+  selectKeyByLabel } from './proxy-logic.js';
 import type { ProxyConfig } from './config.js';
 import { logger, maskKey } from './logger.js';
 import {
@@ -50,6 +50,48 @@ const wbModelCache = new Map<string, { at: number; ids: string[] }>();
 
 // [dsh-patch catalog-warm] 每个 provider 的目录预热时间戳（5 分钟节流）
 const catalogWarmCache = new Map<string, number>();
+
+/**
+ * [dsh-patch session-sticky] 会话 → key 的粘性映射。
+ *
+ * 为什么需要：prompt cache 按 provider/账号各自维护（实测 cc 同前缀第二次
+ * cached=14720/14735，切家则冷启动）。saros 原来每轮按权重随机选 key，
+ * 同一会话在多 key 间跳 = 每轮重新 prefill，token 成本与延迟都翻倍。
+ */
+const stickyKeyByConversation = new Map<string, { label: string; at: number }>();
+
+function stickyTtlMs(): number {
+  return Number(process.env.SESSION_STICKY_TTL_MS ?? 0) || 15 * 60_000;
+}
+
+/** 会话标识：优先客户端 x-opencode-session，其次用对话指纹现算。 */
+function conversationKeyFor(ctx: RetryContext): string | null {
+  if (ctx.conversationKey !== undefined) return ctx.conversationKey;
+  const header = ctx.incomingHeaders.get('x-opencode-session')
+    ?? ctx.incomingHeaders.get('x-session-id')
+    ?? ctx.incomingHeaders.get('x-conversation-id');
+  if (header && header.length >= 8) {
+    ctx.conversationKey = header;
+    return header;
+  }
+  const parsed = parseRequestBody(ctx.bodyText);
+  ctx.conversationKey = parsed ? conversationSessionId(parsed, ctx.modelId) : null;
+  return ctx.conversationKey;
+}
+
+function noteStickyKey(ctx: RetryContext, label: string): void {
+  const key = conversationKeyFor(ctx);
+  if (!key) return;
+  stickyKeyByConversation.set(key, { label, at: Date.now() });
+  // 顺手清理过期项，避免长期运行后无限增长
+  if (stickyKeyByConversation.size > 2000) {
+    const ttl = stickyTtlMs();
+    const now = Date.now();
+    for (const [k, v] of stickyKeyByConversation) {
+      if (now - v.at > ttl) stickyKeyByConversation.delete(k);
+    }
+  }
+}
 
 /**
  * Resolve the upstream URL for one attempt: per-provider base URL + path
@@ -595,6 +637,8 @@ interface RetryContext {
   workbuddyRewrite?: string;
   /** [dsh-patch proxy-mode] 主通道已用的代理 URL（兜底时跳过它，避免同一端口重试）。 */
   primaryProxyUrl?: string;
+  /** [dsh-patch session-sticky] 本请求所属会话标识（惰性计算并缓存，undefined=未算）。 */
+  conversationKey?: string | null;
 }
 
 type AttemptResult =
@@ -829,6 +873,7 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
     const response = await fetchWithHedge(ctx, key, attemptTimeoutMs(ctx), hedgeAfterMs);
     if (response.ok) {
       markKeySucceeded(ctx.state, key.label);
+      noteStickyKey(ctx, key.label);
       completeRequest(ctx.state, ctx.requestId, true);
       const downstream = await ctx.onSuccess(response, ctx.state, ctx.requestId, key.label);
       logger.info(
@@ -1024,6 +1069,20 @@ function pickKey(ctx: RetryContext, attempt: number): KeySnapshot | null {
       const wbProvider = getProvider('workbuddy' as ProviderId);
       // 只有 wb2api 确实能服务这个模型时才优先（否则白跑一趟）
       if (wbProvider && wbProvider.modelAffinity(ctx.modelId) !== 'no') preferProvider = 'workbuddy';
+    }
+    // [dsh-patch session-sticky] 同一会话优先复用上次成功的 key —— 保住上游 prompt cache
+    const convKey = conversationKeyFor(ctx);
+    if (convKey) {
+      const sticky = stickyKeyByConversation.get(convKey);
+      if (sticky && Date.now() - sticky.at <= stickyTtlMs()) {
+        const snap = selectKeyByLabel(ctx.state, ctx.requestId, sticky.label);
+        if (snap && !providerRejectsModel(providerForKey(snap, ctx.config, ctx.modelId), ctx.modelId)) {
+          logger.debug({ requestId: ctx.requestId, conversation: convKey.slice(0, 12), keyLabel: sticky.label },
+            'session sticky hit');
+          return snap;
+        }
+      }
+      stickyKeyByConversation.delete(convKey);
     }
     const first = selectKeyForRequest(ctx.state, ctx.requestId, ctx.modelId, preferProvider);
     if (!first) return null;
