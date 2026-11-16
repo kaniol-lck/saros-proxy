@@ -321,6 +321,10 @@ export const commandcodeProvider: KeyProvider = {
    * 'deepseek/deepseek-v4-flash'). null when the catalog isn't loaded or
    * doesn't serve the name.
    */
+  hasCatalog(): boolean {
+    return catalogCache !== null;
+  },
+
   resolveNativeId(bareName: string): string | null {
     if (!catalogCache) return null;
     return catalogCache.nativeByBare.get(bareName.toLowerCase()) ?? null;

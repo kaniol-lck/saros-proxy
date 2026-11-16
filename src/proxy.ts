@@ -1055,6 +1055,9 @@ function providerCanServe(provider: KeyProvider, modelId: string | undefined): b
   if (provider.id !== 'commandcode') return true;
   const resolveNativeId = provider.resolveNativeId;
   if (!resolveNativeId) return true;
+  // [dsh-patch catalog-ready] 目录没加载 ≠ 服务不了：此时 resolveNativeId 恒为
+  // null，若据此否决会把 cc 整个跳过（实测冷启动期间导致 503）。
+  if (provider.hasCatalog && !provider.hasCatalog()) return true;
   const bare = (modelId.split('/').pop() ?? modelId).toLowerCase();
   return resolveNativeId.call(provider, bare) !== null;
 }

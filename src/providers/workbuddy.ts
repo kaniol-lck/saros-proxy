@@ -155,6 +155,10 @@ export const workbuddyProvider: KeyProvider = {
     return this.modelAffinity(bareName);
   },
 
+  hasCatalog(): boolean {
+    return (catalogCache?.ids.length ?? 0) > 0;
+  },
+
   resolveNativeId(bareName: string): string | null {
     const ids = catalogCache?.ids ?? [];
     if (ids.length === 0) return null; // callers fall back to warm via fetchCatalog

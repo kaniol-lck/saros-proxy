@@ -135,6 +135,15 @@ export interface KeyProvider {
   modelAffinityByName?(bareName: string): ModelAffinity;
 
   /**
+   * [dsh-patch catalog-ready] 目录是否已加载完成。
+   *
+   * resolveNativeId() 在目录未加载时返回 null —— 那表示"还不知道"，不表示
+   * "服务不了"。选点时若拿它当否决条件，冷启动会把该 provider 全部跳过
+   * （实测导致 503）。有目录的 provider 需实现本方法。
+   */
+  hasCatalog?(): boolean;
+
+  /**
    * Map a bare model name to this provider's native catalog id
    * ('deepseek-v4-flash' → 'deepseek/deepseek-v4-flash'), or null when the
    * catalog doesn't serve it. Backed by the provider's live catalog;
