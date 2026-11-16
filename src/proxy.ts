@@ -796,63 +796,105 @@ async function buildAttemptRequest(
  * 谁先出响应头用谁，另一条 abort。目的：oc 重置波段里不用干等 oc 超时，直接抢 cc 的先手。
  * HEDGE_AFTER_MS=0（默认）时退化为普通单请求，行为与之前完全一致。
  */
+interface HedgeOutcome {
+  res: Response;
+  /** 真正产生这个响应的 key（记账/熔断必须用它，不能用主 key）。 */
+  label: string;
+}
+
 async function fetchWithHedge(
   ctx: RetryContext,
   key: KeySnapshot,
   timeoutMs: number,
   hedgeAfterMs: number,
-): Promise<Response> {
+): Promise<HedgeOutcome> {
   const primaryReq = await buildAttemptRequest(ctx, key);
   if (hedgeAfterMs <= 0 || ctx.kind !== 'streaming') {
-    return fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs);
+    return {
+      res: await fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs),
+      label: key.label,
+    };
   }
 
   const hedgeKey = peekAlternativeKeys(ctx.state, ctx.requestId, key.label)
     .find((cand) => providerCanServe(providerForKey(cand, ctx.config, ctx.modelId), ctx.modelId));
   if (!hedgeKey) {
     logger.debug({ requestId: ctx.requestId, keyLabel: key.label }, 'hedge skipped: no eligible alternative key');
-    return fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs);
+    return {
+      res: await fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs),
+      label: key.label,
+    };
   }
 
   const primaryCtrl = new AbortController();
   const hedgeCtrl = new AbortController();
   let timer: ReturnType<typeof setTimeout> | null = null;
 
-  const primary = fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs, primaryCtrl.signal);
-  const hedge = new Promise<{ res: Response; label: string; via: string }>((resolve, reject) => {
+  type Settled =
+    | { kind: 'ok'; res: Response; label: string; via: string }
+    | { kind: 'err'; res: Response; label: string; via: string }
+    | { kind: 'throw'; error: unknown; via: string };
+
+  const settle = (p: Promise<Response>, label: string, via: string): Promise<Settled> =>
+    p.then(
+      (res) => (res.ok
+        ? { kind: 'ok' as const, res, label, via }
+        : { kind: 'err' as const, res, label, via }),
+      (error) => ({ kind: 'throw' as const, error, via }),
+    );
+
+  const primary = settle(
+    fetchWithTimeout(primaryReq.upstreamUrl, primaryReq.fetchOptions, timeoutMs, primaryCtrl.signal),
+    key.label,
+    'primary',
+  );
+  const hedge = new Promise<Settled>((resolve) => {
     timer = setTimeout(() => {
       void (async () => {
         try {
           const hreq = await buildAttemptRequest(ctx, hedgeKey);
-          const res = await fetchWithTimeout(hreq.upstreamUrl, hreq.fetchOptions, timeoutMs, hedgeCtrl.signal);
-          resolve({ res, label: hedgeKey.label, via: 'hedge' });
-        } catch (err) { reject(err); }
+          resolve(await settle(
+            fetchWithTimeout(hreq.upstreamUrl, hreq.fetchOptions, timeoutMs, hedgeCtrl.signal),
+            hedgeKey.label,
+            'hedge',
+          ));
+        } catch (error) { resolve({ kind: 'throw', error, via: 'hedge' }); }
       })();
     }, hedgeAfterMs);
   });
 
-  try {
-    const winner = await Promise.race([
-      primary.then((res) => ({ res, label: key.label, via: 'primary' })),
-      hedge,
-    ]);
-    if (timer) clearTimeout(timer);
-    if (winner.via === 'hedge') {
-      primaryCtrl.abort();
-      logger.warn(
-        { requestId: ctx.requestId, from: key.label, to: winner.label, hedgeAfterMs, ok: winner.res.ok },
-        'hedged request won',
-      );
-    } else {
-      hedgeCtrl.abort();
-    }
-    return winner.res;
-  } catch (err) {
-    if (timer) clearTimeout(timer);
-    hedgeCtrl.abort();
-    primaryCtrl.abort();
-    throw err;
+  const abortLoser = (via: string): void => {
+    if (via === 'hedge') primaryCtrl.abort();
+    else hedgeCtrl.abort();
+  };
+
+  const first = await Promise.race([primary, hedge]);
+  if (timer) clearTimeout(timer);
+
+  // [dsh-patch hedge-prefer-ok] 关键：先到的不一定是好结果。
+  // wb2api 的 no_healthy_account 几乎 0ms 返回 503，若让它"赢"就会把
+  // 本来能成功的 cc（primary）abort 掉 —— 实测造成间歇性 503。
+  if (first.kind === 'ok') {
+    abortLoser(first.via);
+    return { res: first.res, label: first.label };
   }
+
+  // 先到的是错误/异常：给另一方一次机会（它可能更慢但成功）
+  const other = first.via === 'primary' ? hedge : primary;
+  const second = await other;
+  const winner = second.kind === 'ok' ? second : first;
+  if (winner === first) abortLoser(first.via);
+  else abortLoser(second.via);
+
+  if (winner.kind === 'throw') throw winner.error;
+  if (winner.kind === 'err' && winner.via === 'hedge' && winner.res.status) {
+    logger.warn({ requestId: ctx.requestId, from: key.label, to: winner.label,
+      status: winner.res.status }, 'hedged request won with error (no better option)');
+  } else if (winner.via === 'hedge') {
+    logger.warn({ requestId: ctx.requestId, from: key.label, to: winner.label, hedgeAfterMs, ok: true },
+      'hedged request won');
+  }
+  return { res: winner.res, label: winner.label };
 }
 
 async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise<AttemptResult> {
@@ -870,10 +912,15 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
   const attemptStartedAt = Date.now();
   try {
     const hedgeAfterMs = Number(process.env.HEDGE_AFTER_MS ?? 0) || 0;
-    const response = await fetchWithHedge(ctx, key, attemptTimeoutMs(ctx), hedgeAfterMs);
+    const hedged = await fetchWithHedge(ctx, key, attemptTimeoutMs(ctx), hedgeAfterMs);
+    const response = hedged.res;
+    // [dsh-patch hedge-prefer-ok] 用真实产出响应的 key 记账（对冲可能换家）
+    const effectiveKey = hedged.label === key.label
+      ? key
+      : (ctx.state.keys.find((k) => k.label === hedged.label) ?? key);
     if (response.ok) {
-      markKeySucceeded(ctx.state, key.label);
-      noteStickyKey(ctx, key.label);
+      markKeySucceeded(ctx.state, effectiveKey.label);
+      noteStickyKey(ctx, effectiveKey.label);
       completeRequest(ctx.state, ctx.requestId, true);
       const downstream = await ctx.onSuccess(response, ctx.state, ctx.requestId, key.label);
       logger.info(
@@ -891,7 +938,9 @@ async function executeSingleAttempt(attempt: number, ctx: RetryContext): Promise
       );
       return { kind: 'done', response: downstream };
     }
-    return await handleUpstreamErrorResponse(response, ctx, key);
+    // [dsh-patch hedge-prefer-ok] 用真实产出响应的 key 分类与记账，
+    // 否则对冲换家后会把 wb2api 的错误记到 cc 头上（曾导致误判 ModelUnavailable）。
+    return await handleUpstreamErrorResponse(response, ctx, effectiveKey);
   } catch (err) {
     // [dsh-patch same-key-retry] 网络类失败（且不是 Connect Timeout —— 那说明路径断了）时，
     // 先用 10s 短超时对同一把 key 再试一次：瞬时 ECONNRESET / other side closed 常能一次救回，
